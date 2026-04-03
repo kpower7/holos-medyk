@@ -6,7 +6,7 @@ const String _systemPrompt =
     'Be concise and direct. Respond only in Ukrainian.';
 
 const String _modelUrl =
-    'https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it.litertlm';
+    'https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/main/gemma-4-E4B-it.litertlm';
 
 class GemmaService {
   dynamic _model;
