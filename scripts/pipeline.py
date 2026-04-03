@@ -72,8 +72,8 @@ class VoiceRecorder:
         audio_chunks = []
         speech_detected = False
         last_speech_time = None
-        chunk_duration = 0.03  # 30ms chunks for VAD
-        chunk_samples = int(self.sample_rate * chunk_duration)
+        chunk_samples = 512  # Silero VAD requires exactly 512 samples at 16kHz
+        chunk_duration = chunk_samples / self.sample_rate
 
         stream = sd.InputStream(
             samplerate=self.sample_rate,
