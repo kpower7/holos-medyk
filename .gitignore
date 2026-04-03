@@ -50,5 +50,11 @@ logs/
 # Piper TTS voices (large files)
 voices/
 
+# llama.cpp binaries (large, platform-specific)
+tools/llama-cpp/
+
+# Test output
+test_output/
+
 # HuggingFace cache
 .cache/
