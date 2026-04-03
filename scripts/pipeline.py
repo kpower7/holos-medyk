@@ -319,7 +319,7 @@ def run_pipeline(args):
 
     # Initialize components
     recorder = None if args.text else VoiceRecorder()
-    asr = None if args.text else ASR(model_size="tiny")
+    asr = None if args.text else ASR(model_size=args.asr_model)
     llm = LLM(model=args.model)
     tts = None if args.no_tts else TTS(voice=args.voice)
 
@@ -376,6 +376,8 @@ def main():
     parser.add_argument("--voice", "-v", default="ukrainian_tts", choices=VOICES.keys())
     parser.add_argument("--text", "-t", default=None, help="Skip mic, use this text input")
     parser.add_argument("--no-tts", action="store_true", help="Skip speech output")
+    parser.add_argument("--asr-model", default="small", choices=["tiny", "small", "medium"],
+                        help="Whisper model size (default: small)")
     args = parser.parse_args()
 
     os.environ["PYTHONUTF8"] = "1"

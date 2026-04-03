@@ -24,12 +24,19 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _initModel() async {
     final state = context.read<AssistantState>();
     try {
+      debugPrint('[INIT] Starting model initialization...');
       await _gemmaService.initialize(
-        onProgress: (progress) => state.setModelProgress(progress),
+        onProgress: (progress) {
+          debugPrint('[INIT] Progress: ${(progress * 100).toInt()}%');
+          state.setModelProgress(progress);
+        },
       );
+      debugPrint('[INIT] Model ready!');
       state.setModelReady();
-    } catch (e) {
-      state.setError('Помилка завантаження: $e');
+    } catch (e, stack) {
+      debugPrint('[INIT] ERROR: $e');
+      debugPrint('[INIT] STACK: $stack');
+      state.setError('Помилка: $e');
     }
   }
 
@@ -152,26 +159,27 @@ class _HomeScreenState extends State<HomeScreen> {
             size: 32,
           ),
           const SizedBox(width: 12),
-          const Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Голос Медик',
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.bold,
+          const Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Голос Медик',
+                  style: TextStyle(
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
-              ),
-              Text(
-                'Holos Medyk',
-                style: TextStyle(
-                  fontSize: 14,
-                  color: Colors.grey,
+                Text(
+                  'Holos Medyk',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Colors.grey,
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
-          const Spacer(),
           // Offline indicator
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -298,9 +306,12 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           const SizedBox(width: 8),
-          Text(
-            state.statusText,
-            style: const TextStyle(fontSize: 14, color: Colors.grey),
+          Flexible(
+            child: Text(
+              state.statusText,
+              style: const TextStyle(fontSize: 14, color: Colors.grey),
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
         ],
       ),
