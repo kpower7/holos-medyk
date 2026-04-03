@@ -51,7 +51,7 @@ logs/
 voices/
 
 # llama.cpp binaries (large, platform-specific)
-tools/llama-cpp/
+tools/
 
 # Test output
 test_output/
