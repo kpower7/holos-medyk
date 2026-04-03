@@ -1,0 +1,39 @@
+name: holos_medyk
+description: "Holos Medyk — Offline emergency medical voice assistant for Ukrainian civilians"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # Gemma LLM on-device inference via LiteRT-LM
+  flutter_gemma: ^0.13.0
+
+  # Audio playback
+  audioplayers: ^6.1.0
+
+  # TTS (platform native as fallback)
+  flutter_tts: ^4.2.0
+
+  # Permissions
+  permission_handler: ^11.3.0
+
+  # State management
+  provider: ^6.1.0
+
+  # File paths
+  path_provider: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
