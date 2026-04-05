@@ -1,0 +1,310 @@
+%%%%%%%% ICML 2026 SUBMISSION STYLE %%%%%%%%%%%%%%%%%
+%
+% Holos Medyk project documentation.
+% Format adapted from redteam_icml_v4.tex template.
+% This file is intentionally maintained as a living document and updated
+% at the end of each development day. See the changelog at the bottom.
+
+\documentclass{article}
+
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\newcommand{\theHalgorithm}{\arabic{algorithm}}
+
+\usepackage{icml2026}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\usepackage[textsize=tiny]{todonotes}
+
+\icmltitlerunning{Holos Medyk: An Offline Voice Medical Assistant for Ukrainian Civilians}
+
+\begin{document}
+
+\twocolumn[
+  \icmltitle{Holos Medyk: Distilling Frontier Reasoning into an Offline,\\
+  Ukrainian-Language Voice Medical Assistant for Warzone First Aid}
+
+  \icmlsetsymbol{equal}{*}
+
+  \begin{icmlauthorlist}
+    \icmlauthor{Kevin Power}{mit}
+  \end{icmlauthorlist}
+
+  \icmlaffiliation{mit}{Massachusetts Institute of Technology, Cambridge, MA, USA}
+
+  \icmlcorrespondingauthor{Kevin Power}{kevpower@mit.edu}
+
+  \icmlkeywords{Gemma 4, LiteRT, On-Device LLM, Reasoning Distillation, Medical AI, Ukrainian NLP, Edge Deployment, Voice Interface}
+
+  \vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+We present \textbf{Holos Medyk} (Голос Медик, ``The Voice Medic''), an offline voice-interactive medical assistant designed for Ukrainian civilians under bombardment. When buildings fall and infrastructure fails, a phone in airplane mode must become a capable first aid coach — speaking natural Ukrainian or English, reasoning about warzone trauma, and walking a panicked parent through stopping arterial bleeding with household materials. Holos Medyk is built on Google's Gemma 4 E4B and deploys via LiteRT-LM on both a free Android application and an inexpensive Raspberry Pi 5 standalone device. The model is fine-tuned through a reasoning-distillation pipeline that extracts 3{,}511 thinking traces from Gemini 2.5 Pro across warzone trauma and general medical scenarios, then trains Gemma 4 E4B to internalize this reasoning while producing fast, voice-ready final answers at inference time. The training corpus spans hemorrhage, crush and blast injury, burns, airway management, shock, triage, psychological crisis, post-Soviet folk remedy myths, and culturally appropriate medication guidance using international generic drug names. In this document we describe the data pipeline, prompt curation methodology, reasoning distillation approach, and the end-to-end deployment stack from fine-tuning through on-device voice interaction. This is a living document; it is updated at the end of each development day and will serve as the backbone of the eventual hackathon write-up.
+\end{abstract}
+
+\section{Introduction}
+
+On any given night in eastern Ukraine, civilians are injured in their homes. Infrastructure is routinely damaged; cellular networks fail under load or are deliberately disrupted; power is intermittent. In the first thirty minutes after a blast, a non-medical bystander is often the only possible caregiver. There is a large body of research on traumatic injury management under such conditions, but it is locked behind textbooks, trained personnel, internet access, and language barriers that do not survive the conditions in which the knowledge is most needed.
+
+Holos Medyk is an attempt to package that knowledge into a device people already carry --- or one that can be built for under \$75 --- and to make it speak to them in Ukrainian, listen to them in Ukrainian, and reason about their specific situation rather than reading out a generic wiki article. The constraints of the problem are unusually rigid: no internet, no GPU, low latency (voice output must begin within two seconds), a small memory budget (4--6 GB RAM on target hardware), and the requirement that the model never refuse to help or deflect to ``please consult a professional'' when there is no professional available.
+
+\subsection{Design principles}
+
+Four principles drive the design:
+
+\begin{enumerate}
+\item \textbf{Offline is the product.} Cloud models are forbidden, not as a purity test but because the deployment environment precludes them. Every component --- speech-to-text, language model, text-to-speech --- must run on-device. We target Gemma 4 E4B as the language model, running through Google's LiteRT-LM runtime on both Android and ARM Linux.
+\item \textbf{The model must be willing to help.} Generic safety training on medical subject matter produces assistants that routinely decline to answer anything more consequential than a paper cut. In a warzone this is worse than useless. Fine-tuning must preserve correctness while eliminating reflexive refusal on legitimate emergency queries.
+\item \textbf{Reason deeply, answer quickly.} Warzone voice interaction cannot tolerate ten-second thinking traces; the first audible word must come fast. But answer quality on complex triage scenarios benefits enormously from intermediate reasoning. We resolve this with reasoning distillation: we train the student on full thinking traces from a frontier teacher, then prompt it at inference to skip visible reasoning. The reasoning capability is baked into the weights even when it is not displayed.
+\item \textbf{Ukrainian is a first-class language, not an afterthought.} We reject English-centric training corpora that treat Ukrainian as a translation target. Civilian speech uses colloquial register (\emph{скрізь кров}) rather than clinical register (\emph{геморагія}), and folk remedies (банки, гірчичники, горілка rubs) are culturally specific and must be addressed without dismissiveness.
+\end{enumerate}
+
+\subsection{Contributions}
+
+This document describes the contributions of the Holos Medyk project to date:
+
+\begin{itemize}
+\item A two-tier deployment architecture: a free Android application using LiteRT-LM on-device and a Raspberry Pi 5 standalone device for environments where phones are unavailable, both running identical fine-tuned weights.
+\item An end-to-end voice pipeline (microphone $\rightarrow$ voice activity detection $\rightarrow$ speech recognition $\rightarrow$ Gemma 4 $\rightarrow$ Piper text-to-speech $\rightarrow$ speaker) validated on both deployment targets.
+\item A reproducible training corpus of 3{,}511 prompt/response/thinking triplets built through iterative subagent-driven prompt generation, a Gemini 2.5 Pro teacher step capturing reasoning traces via the \texttt{include\_thoughts} API, and automated quality cleanup passes. Approximately 58\% of the data covers warzone trauma and 42\% covers general civilian medicine; roughly 25\% of prompts and responses are in colloquial Ukrainian.
+\item An Unsloth-based fine-tuning pipeline that distills these traces into Gemma 4 E4B via LoRA, with exports to merged 16-bit weights and GGUF formats for downstream llama.cpp and LiteRT-LM deployment.
+\item Cultural and linguistic calibration for the Ukrainian civilian audience, including deliberate removal of US drug brand names (Tylenol, Advil, Benadryl) in favor of international generics (paracetamol, ibuprofen, diphenhydramine) and explicit handling of post-Soviet folk remedy myths.
+\end{itemize}
+
+\section{Related Work}
+
+\subsection{Offline medical assistants}
+
+Static first-aid reference applications (Red Cross, IFRC) have long been available offline, but they are fundamentally read-only: the user cannot describe a specific situation and receive situation-specific guidance. Conversational medical assistants such as Infermedica and AidSnap exist but require cloud connectivity for model inference, which is precisely what fails in the environments we target. Wilderness-survival-oriented local LLMs (Private LLM SurviveV3, UltraMedical) run on-device but are generic rather than warzone-trauma-specific and do not support Ukrainian. Pi-Card and related GitHub projects demonstrate offline voice assistants on Raspberry Pi hardware but make no claim to medical correctness and are English-only. We are, to our knowledge, the first project combining offline voice, fine-tuned warzone medical reasoning, and native Ukrainian into a deployable two-tier product.
+
+\subsection{Ukrainian language models}
+
+MamayLM from INSAIT is the first Ukrainian-focused LLM built on Gemma 3. It is general-purpose and has no medical specialization, no voice pipeline, and is not deployed to edge devices. Our work complements rather than competes with MamayLM: we share the commitment to first-class Ukrainian, but focus on a narrow, high-stakes application domain with deployment constraints that a general-purpose assistant is not optimized for.
+
+\subsection{Reasoning distillation}
+
+Our fine-tuning approach is based on recent work showing that exposing a student model to a frontier teacher's intermediate reasoning traces, rather than only its final answers, substantially improves student reasoning capability on held-out tasks. DeepSeek-R1-Distill and s1 both demonstrate that this works on small models and that the reasoning capability is internalized into weights even when the student is prompted to produce only final answers at inference time. We apply this technique to a novel domain (warzone first aid) and a novel teacher (Gemini 2.5 Pro thinking traces via Vertex AI), with the explicit goal of preserving the inference speed required for voice interaction on edge hardware.
+
+\section{System Architecture}
+
+Holos Medyk consists of three layers: (1) a training pipeline that produces fine-tuned Gemma 4 E4B weights, (2) a runtime inference stack that deploys those weights through LiteRT-LM, and (3) two concrete application surfaces built on top of the runtime --- a Flutter Android app and a Raspberry Pi 5 voice pipeline.
+
+\subsection{Deployment targets}
+
+\textbf{Tier 1: Android application.} The primary product is a free Flutter application running Gemma 4 E4B on-device via LiteRT-LM. Target hardware is any modern Android phone with at least 6~GB of RAM. Initial download is approximately 4~GB (model weights plus application), after which the assistant runs indefinitely offline. This tier targets the roughly twenty million Ukrainians with smartphones and represents the distribution mechanism with the largest possible reach.
+
+\textbf{Tier 2: Raspberry Pi 5 standalone device.} For community shelters, aid stations, hospitals, and environments where personal phones are unavailable, a Raspberry Pi 5 (8~GB) with a USB microphone, 3.5~mm speaker, and battery bank runs the same Gemma 4 weights through LiteRT-LM. Our prototype was built for approximately \$311; at component volume a production BOM of \$50--75 per unit is feasible.
+
+Both tiers run identical model weights, which means a single fine-tuning run updates both surfaces simultaneously.
+
+\subsection{Voice pipeline}
+
+The voice pipeline implemented on the Raspberry Pi target consists of: (1) microphone capture at 16~kHz, (2) Silero voice activity detection with a strict 512-sample chunk requirement, (3) on-device speech recognition, (4) Gemma 4 E4B inference via LiteRT-LM, (5) Piper neural text-to-speech, (6) speaker output. Early versions of the pipeline used a two-model decomposition (separate ASR model feeding a text-only LLM), but we subsequently discovered that Gemma 4 E4B has native audio-input capability, which allowed us to replace the ASR stage with direct audio ingestion and reduce total component count. A dedicated Flutter gemma\_service wraps the same LiteRT-LM runtime on Android.
+
+\section{Training Data Pipeline}
+
+The model is fine-tuned on 3{,}511 prompt/response/thinking triplets generated through a four-stage pipeline: (1) prompt curation via iterative subagent generation, (2) teacher response generation with reasoning trace capture, (3) quality audit and cleanup, and (4) format conversion to Unsloth-ready training JSONL.
+
+\subsection{Prompt curation}
+
+Training prompts were generated across seven topic files, split between two target system prompts:
+
+\begin{itemize}
+\item \textbf{Warzone trauma (DeepSeek batches, 2{,}009 prompts)} covering hemorrhage and blast injury (508 prompts), crush injury and fractures (500), burns, airway management and shock (501), and triage, safety/refusal scenarios, psychological crisis, environmental hazards, and Ukrainian-specific content (500).
+\item \textbf{General civilian medicine (MedGemma batches, 1{,}502 prompts)} covering symptom severity and infection recognition (502), chronic condition emergencies and pediatric medicine (500), and pharmacology safety, dangerous folk myths, mental health crisis, and Ukrainian-language medical prompts (500).
+\end{itemize}
+
+Prompts were generated through five sequential rounds of seven parallel sub-agent calls (35 agent invocations total), with each round instructed to read the existing file contents first and avoid duplication. Within-round parallelism came from running all seven topic files simultaneously; across-round sequencing provided duplicate avoidance and allowed us to steer later rounds toward underrepresented edge cases (junctional hemorrhage, partial amputations, radiation burns, mass-casualty triage with single helper, prolonged shelter medicine scenarios, and so on).
+
+A quality cleanup pass then removed prompts that were too vague for a medical model to respond substantively (for example ``there's blood everywhere help'' with no body-part or injury context), prompts that were pure emotional panic with no actionable content, and --- critically for the pharmacology batch --- prompts that referenced US brand-name drugs that do not exist in Ukrainian pharmacies. We replaced 62 removed prompts with situationally detailed alternatives, and in the pharmacology batch specifically we substituted post-Soviet folk remedy scenarios (цибуля в шкарпетки, йодна сітка, гірчичники, горілка as fever treatment) which are culturally specific, widely believed, and in several cases dangerous to actually follow.
+
+\subsection{Teacher response generation}
+
+Teacher responses were generated using Gemini 2.5 Pro via Vertex AI with service account authentication, bypassing the restrictive per-day request quotas imposed on the Generative Language API tier. Generation used 20 parallel workers and completed 3{,}511 responses in approximately 27 minutes of wall-clock time. Each response was generated with \texttt{include\_thoughts=True} and a 1{,}024-token thinking budget, capturing both the final answer and the model's full intermediate reasoning trace.
+
+Two distinct system prompts were used, matched to the two data categories:
+
+\begin{itemize}
+\item The warzone prompt establishes Holos Medyk as a voice assistant to civilians during or after bombardment, enforces short voice-appropriate responses (3--8 sentences), requires specific physical instructions, mandates firm refusal of dangerous actions (``do not pull out shrapnel'') paired with a safe alternative, and forbids both ``I'm an AI'' disclaimers and ``please seek professional help'' deflection on the grounds that no professional is available.
+\item The general medical prompt establishes a civilian-audience medical assistant emphasizing generic international drug names, culturally respectful handling of folk remedies, compassionate mental health crisis response, and the same prohibition on refusal-to-help behavior.
+\end{itemize}
+
+The generated thinking traces average 1{,}200--1{,}500 characters and show genuine stepwise reasoning rather than restating the final answer. Examples include explicit differential diagnosis (``crepitus plus fever plus rapid spread suggests necrotizing fasciitis''), triage rationale in mass-casualty scenarios, and mechanism-of-harm explanations for folk remedy myths.
+
+\subsection{Quality audit and cleanup}
+
+Two parallel audit subagents reviewed the full 3{,}511-record corpus and sampled $\sim$20 records per file for manual inspection. Overall dataset grades were A$-$ for the warzone set and A for the general medical set. Full-dataset regex sweeps verified: zero language mismatches (English-prompt English-response; Ukrainian-prompt Ukrainian-response), zero ``I'm an AI'' disclaimers, zero responses exceeding the 1{,}200-character voice-output ceiling, and correct generic drug naming in the pharmacology batch. A single ``Tylenol'' leak was detected and corrected.
+
+The audit did identify 503 records (14\% of the corpus, concentrated in the burns/airway/shock batch and the triage batch) with empty thinking fields. A cleanup script regenerated these records, normalized drug names across batches 1 and 2 (substituting \texttt{acetaminophen} $\rightarrow$ \texttt{paracetamol}, \texttt{Tylenol} $\rightarrow$ \texttt{paracetamol}, \texttt{Advil} $\rightarrow$ \texttt{ibuprofen}, \texttt{Motrin} $\rightarrow$ \texttt{ibuprofen} via case-preserving regex substitution), and removed a small number of stray parentheticals introduced by the replacement process. After two cleanup passes, 3{,}509 of 3{,}511 records (99.94\%) contained populated thinking traces; the two stubborn empty records involved prompts short enough that Gemini 2.5 Pro short-circuited the thinking budget entirely.
+
+\subsection{Training corpus format}
+
+The final training corpus (\texttt{data/training/train\_holos\_medyk.jsonl}) converts each record into a three-turn chat: a system prompt (warzone or general medical, matched to the source batch), a user turn containing the original prompt, and an assistant turn in the format
+
+\begin{verbatim}
+<thinking>...</thinking>
+<answer>...</answer>
+\end{verbatim}
+
+where the \texttt{<thinking>} block contains the captured teacher reasoning trace and the \texttt{<answer>} block contains the final user-facing response. This explicit tag structure allows the model to be prompted at inference time to either produce both blocks (``show your work'') or to skip directly to \texttt{<answer>} (``voice mode''), with the reasoning capability baked into the weights in both cases. Warzone and medical examples are shuffled together so neither category dominates training early or late. Median record length is approximately 2{,}400 characters; the 95th-percentile length is 3{,}615 characters, which is comfortably within a 2{,}048-token sequence length budget.
+
+\section{Fine-Tuning}
+
+\subsection{Approach and rationale}
+
+Fine-tuning uses Unsloth for LoRA-based supervised fine-tuning with a reasoning-distillation objective. The base model is Gemma 4 E4B-it. We explicitly considered three alternative training frameworks before selecting Unsloth:
+
+\begin{itemize}
+\item \textbf{Google Tunix on TPU.} The author has previous experience with Tunix from an earlier hackathon (IDEA-E Distillation with GRPO, 2025), and Tunix would have been the most on-theme choice for a Gemma-themed event. However, at the time of writing Tunix supports gemma, gemma2, and gemma3 model families but has no gemma4 implementation, and the architectural delta from Gemma 3 to Gemma 4 is non-trivial (split attention head dimensions, eliminated V-projection in global layers, proportional RoPE, value-side RMSNorm). A from-scratch Gemma 4 port to Tunix is estimated at several days of engineering and debugging, which we judged an unacceptable risk to the project timeline. Tunix remains a candidate for a post-hackathon follow-up.
+\item \textbf{Tinker (Thinking Machines).} A strong story option given its novelty, but Gemma 4 support at submission time was uncertain.
+\item \textbf{Hugging Face TRL SFTTrainer.} The most mature and general option. Works fine, but Unsloth provides roughly 2x training throughput at comparable quality and has day-0 Gemma 4 support including the E2B, E4B, 26B-A4B, and 31B variants.
+\end{itemize}
+
+We selected Unsloth on the strength of day-0 Gemma 4 support, the 2x speedup, and the existence of a direct GGUF export path from the same training script that produces the LoRA adapter. This minimizes the number of format conversions between training and on-device deployment.
+
+\subsection{Configuration}
+
+Training uses the parameters shown in Table~\ref{tab:training-config}. The central design choices are: bf16 LoRA rather than QLoRA 4-bit (we have sufficient VRAM on the rental GPU and prefer the quality ceiling), LoRA rank 32 (standard for SFT distillation on $\sim$3{,}500 examples; higher ranks risk overfit), 3 epochs with cosine learning rate decay (yields approximately 1{,}316 gradient steps at effective batch 8), and a conservative 2e-4 learning rate with 5\% warmup.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Fine-tuning configuration for Holos Medyk on Gemma 4 E4B.}
+\label{tab:training-config}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Base model & \texttt{google/gemma-4-E4b-it} \\
+Framework & Unsloth + TRL SFTTrainer \\
+Precision & bf16 \\
+LoRA rank / alpha & 32 / 32 \\
+LoRA targets & q,k,v,o,gate,up,down \\
+Max sequence length & 2{,}048 tokens \\
+Learning rate & 2e-4, cosine decay \\
+Warmup & 5\% of total steps \\
+Batch / grad accum & 2 / 4 (eff.\ 8) \\
+Epochs & 3 \\
+Total steps (approx.) & 1{,}316 \\
+Optimizer & adamw\_8bit \\
+Hardware target & NVIDIA A100 40GB \\
+Expected runtime & 60--90 minutes \\
+Estimated cloud cost & \$3--5 on RunPod \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Artifacts}
+
+The training script exports four artifacts from a single run: the LoRA adapter alone (for future merging experiments and ablations), the full merged model in bf16 (as a quality reference and for potential re-exports), a q4\_k\_m GGUF (the deployment artifact for Raspberry Pi and other llama.cpp targets), and an f16 GGUF (as a higher-quality reference for laptop inference and evaluation). The q4\_k\_m GGUF is approximately 2.5~GB and targets the memory budget of the Raspberry Pi 5 8~GB and typical mid-range Android devices.
+
+\subsection{Status}
+
+At the time of writing, the training pipeline has been fully assembled and dry-run locally, and the training corpus has been built and verified. The actual training run is pending a RunPod A100 instance. This section will be updated with loss curves, wall-clock training time, artifact checksums, and a smoke-test evaluation once the run completes.
+
+\section{Evaluation Plan}
+
+Evaluation of Holos Medyk is deliberately narrower than typical LLM benchmarks, because the deployment constraints impose specific quality criteria that general-purpose benchmarks do not measure. We will evaluate the fine-tuned model on four axes:
+
+\begin{enumerate}
+\item \textbf{Fast-path latency on edge hardware.} Voice output must begin within two seconds of the end of user speech. We will measure time-to-first-token on both the Raspberry Pi 5 target and a representative Android handset, with the model prompted to skip visible thinking and jump directly to the \texttt{<answer>} block.
+\item \textbf{Direct-answer quality preservation.} Having trained on thinking-traced examples, we need to verify that fast-path (thinking-skipped) responses are at least as good as responses from a baseline model that was never trained with thinking. We will sample 100 held-out prompts across warzone and medical categories and score responses on (a) medical correctness against TCCC and general medicine standards, (b) tone adherence to the Holos Medyk persona, and (c) Ukrainian fluency for Ukrainian prompts.
+\item \textbf{Refusal suppression without safety regression.} The fine-tune should eliminate reflexive refusals (``please consult a medical professional'') on legitimate emergency queries, while still firmly refusing genuinely dangerous actions (patient self-medicating with unknown pills, pulling out embedded objects, attempting field surgery). We will test a manually curated set of 30 safety-sensitive prompts and verify the model gives a firm but helpful response in each case.
+\item \textbf{Language match integrity.} English prompts must get English responses; Ukrainian prompts must get Ukrainian responses. The teacher corpus already achieved zero mismatches in 3{,}511 records, and the student must preserve this property.
+\end{enumerate}
+
+The evaluation script will be written in the same style as the Gemini 2.5 Pro teacher call script, using the held-out GGUF via llama.cpp, so that the evaluation harness is itself portable to the edge-deployment target.
+
+\section{Timeline and Daily Changelog}
+\label{sec:changelog}
+
+This section is the living log of the project. Each day we add a dated entry describing what was done, what was learned, and what comes next. The current entry sits at the top; older entries accumulate below. At the end of the project this changelog will be flattened into a chronological narrative for the final write-up.
+
+\subsection*{Day 1 --- 2026-04-05 (Saturday): Training data pipeline and fine-tuning setup}
+
+\textbf{Summary.} Built the full training data corpus end-to-end and assembled the Unsloth fine-tuning pipeline. Training run is pending a cloud GPU.
+
+\textbf{What was done.}
+\begin{itemize}
+\item \textbf{Prompt generation.} Generated 3{,}509 training prompts across seven topic files (four warzone trauma, three general medical) via five rounds of seven parallel subagent calls. Each subagent was given a topic-specific focus area per round (junctional hemorrhage, partial amputations, pediatric fractures, post-Soviet folk myths, mass-casualty triage under shelling, and so on) and read its existing file content before generating to avoid duplicates. Total: 35 subagent invocations.
+\item \textbf{Prompt cleanup.} Ran a quality cleanup subagent pass on all seven files. Removed 62 prompts that were too vague for substantive medical response (``there's blood everywhere help''), scene-description-only prompts with no medical content, and --- in the pharmacology batch --- 19 prompts referencing US brand-name drugs (Tylenol, Advil, Benadryl, Plan B, CBD products) that do not exist in Ukrainian pharmacies. Replacements focused on culturally appropriate post-Soviet folk remedy myths and war-context mental health scenarios.
+\item \textbf{Teacher response generation.} Generated 3{,}511 prompt/response/thinking triplets using Gemini 2.5 Pro via Vertex AI with a service account. This was non-trivial: the Gemini Developer API (generativelanguage.googleapis.com) imposes a 250-requests-per-day hard cap on preview models and a 1{,}000 RPD cap on Gemini 2.5 Pro even under Tier 1 paid billing. The author burned through both limits in a single afternoon before discovering that Vertex AI (aiplatform.googleapis.com) with a service account key bypasses the Developer API quota system entirely and charges per token with no daily request cap. After the switch, the full 3{,}511-response run completed in 26.8 minutes of wall-clock time at 20 parallel workers, versus an estimated 4+ hours on the quota-limited path and 18 hours on the naive sequential path we started with. Total teacher compute cost: approximately \$8.
+\item \textbf{Thinking trace capture.} Responses were generated with \texttt{thinkingConfig.includeThoughts=true} and a 1{,}024-token thinking budget, yielding 1{,}200--1{,}500 character reasoning traces for roughly 86\% of the corpus on the first pass.
+\item \textbf{Quality audit.} Dispatched two parallel audit subagents (one for the four warzone files, one for the three medical files). Both audits returned A-range grades. Full-corpus regex sweeps confirmed zero language mismatches, zero ``I'm an AI'' disclaimers, zero overlength responses, and one stray ``Tylenol'' reference which was subsequently corrected. The audits flagged 503 records (14\% of the corpus) with empty thinking fields, concentrated in the burns/airway/shock batch (51\% empty) and triage batch (28\% empty).
+\item \textbf{Cleanup pass on responses.} Wrote a cleanup script that re-runs Vertex AI generation on empty-thinking records in parallel and applies regex-based drug-name normalization across all responses. After two passes, 3{,}509 of 3{,}511 records (99.94\%) had populated thinking traces, and 28 US brand-name references had been substituted for generics.
+\item \textbf{Training corpus assembly.} Converted the seven response JSONL files into a single shuffled \texttt{train\_holos\_medyk.jsonl} in Unsloth chat format, with each record wrapping the assistant turn in \texttt{<thinking>...</thinking><answer>...</answer>}. Median content length is 2{,}384 characters, 95th-percentile is 3{,}615 characters.
+\item \textbf{Fine-tuning script.} Wrote \texttt{training/train\_holos\_medyk.py}, which loads Gemma 4 E4B in bf16, applies LoRA rank 32 to the seven standard attention and MLP projection targets, runs 3 epochs at effective batch 8 with cosine-decayed 2e-4 learning rate, and exports four artifacts at the end (LoRA adapter, merged bf16, q4\_k\_m GGUF, f16 GGUF).
+\item \textbf{Git hygiene.} Committed the prompt corpus, response corpus, generation and cleanup scripts, and the fine-tuning script as three separate commits. Service account JSON moved out of the repository tree to a private keys directory and added to \texttt{.gitignore}.
+\end{itemize}
+
+\textbf{What was learned.}
+\begin{itemize}
+\item Batching large prompt generation across subagents is substantially more efficient than asking a single agent to produce thousands of items at once. A single agent run past $\sim$150 prompts produces visibly degraded diversity; 35 agents at $\sim$100 prompts each produces a better corpus in less total elapsed time.
+\item Google's two Gemini API surfaces are fundamentally different products. The Developer API (API-key authenticated) has preview-model hard caps that paid tier does not eliminate. Vertex AI (service-account authenticated) has no equivalent cap. For any project requiring more than a few hundred frontier-model calls per day, Vertex AI is the correct surface.
+\item Teacher reasoning traces are more brittle to capture than the final answers. When the teacher short-circuits a thinking trace (typically on very short prompts), the trace field is silently empty. Any pipeline that depends on the thinking field needs an explicit post-hoc regeneration step.
+\item Drug naming is a silent but high-impact localization hazard. US models default to US brand names even with an explicit ``international generics only'' system prompt, because the brand names appear in the user prompts the teacher is responding to. A post-hoc regex normalization pass is the simplest fix.
+\end{itemize}
+
+\textbf{What comes next (Day 2).}
+\begin{itemize}
+\item Spin up a RunPod A100 40GB and execute the Unsloth training run.
+\item Run the smoke-test evaluation on the merged model locally before any edge deployment.
+\item Sync the q4\_k\_m GGUF to the Pi and perform a first round of on-device voice interaction tests.
+\end{itemize}
+
+\subsection*{Days prior --- Context from pre-Day-1 git history}
+
+The voice pipeline and Flutter application predate the Day 1 entry above and were built over the preceding week. Commit history shows the following progression:
+
+\begin{itemize}
+\item \texttt{b540c2b} (initial): Project skeleton, Gemma 4 inference working via LiteRT-LM, Piper text-to-speech working locally.
+\item \texttt{ba5fdff}: End-to-end voice pipeline on the Raspberry Pi: microphone input $\rightarrow$ Silero VAD $\rightarrow$ ASR $\rightarrow$ Gemma 4 $\rightarrow$ Piper $\rightarrow$ speaker.
+\item \texttt{dd428a4}: VAD chunk size fix. Silero requires exactly 512-sample chunks at 16~kHz; an earlier implementation used a different chunk size and failed silently.
+\item \texttt{5ceea4a}: Flutter application scaffolding with LiteRT-LM Gemma 4 integration.
+\item \texttt{5d4804a}: Fixed FlutterGemma initialization and UI layout overflow; switched between E2B and E4B model variants during sizing experiments; fixed VAD in the Flutter voice path.
+\item \texttt{9ca9396}: Full Flutter app scaffolding (Android and iOS targets); settled on E4B as the production model variant.
+\item \texttt{a07c115}: Replaced the separate ASR stage on the Raspberry Pi with Gemma 4's native audio input via LiteRT-LM, simplifying the pipeline component count.
+\end{itemize}
+
+\section{Open Questions}
+
+This section tracks open technical and product questions whose answers will shape later sections of this document. They are listed in no particular order and will be crossed off as they are resolved.
+
+\begin{itemize}
+\item[$\square$] Does the fine-tuned model's fast-path (thinking-skipped) output genuinely benefit from the thinking traces it was trained on, or would we get comparable quality from a cheaper SFT over final answers only? Answer requires an ablation run.
+\item[$\square$] How does q4\_k\_m quantization affect Ukrainian response quality specifically? Low-resource languages sometimes suffer disproportionately under aggressive quantization. We will check this by comparing q4\_k\_m and f16 GGUF outputs on the same held-out prompts.
+\item[$\square$] What is the actual on-device time-to-first-token on the Raspberry Pi 5 8~GB under voice-mode prompting? The two-second budget is a product requirement; we need measured latency under the target deployment configuration.
+\item[$\square$] Does Gemma 4's native audio input on LiteRT-LM preserve Ukrainian speech recognition accuracy comparable to a dedicated ASR model? The recent pipeline simplification assumes yes; we need to verify on Ukrainian warzone-appropriate test audio.
+\item[$\square$] Is there value in a second fine-tuning pass that oversamples Ukrainian examples, given that the current corpus is approximately 75\% English?
+\item[$\square$] Can we run an ablation against a Tunix-trained baseline if we later port Gemma 4 to Tunix? This would be a strong story for a Google hackathon but is not on the critical path.
+\end{itemize}
+
+\section{Acknowledgements}
+
+This work is being prepared for the Gemma 4 Good Hackathon. The author would like to thank the Google DeepMind Gemma team for the Gemma 4 open release, the Unsloth team for day-0 fine-tuning support, and Thinking Machines for the Tinker research grant (to be used for a future follow-up).
+
+\end{document}
