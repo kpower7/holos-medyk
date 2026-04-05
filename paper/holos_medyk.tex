@@ -242,9 +242,9 @@ The evaluation script will be written in the same style as the Gemini 2.5 Pro te
 \section{Timeline and Daily Changelog}
 \label{sec:changelog}
 
-This section is the living log of the project. Each day we add a dated entry describing what was done, what was learned, and what comes next. The current entry sits at the top; older entries accumulate below. At the end of the project this changelog will be flattened into a chronological narrative for the final write-up.
+This section is the living log of the project. Each day we add a dated entry describing what was done, what was learned, and what comes next. The most recent entry sits at the top; older entries accumulate below. At the end of the project this changelog will be flattened into a chronological narrative for the final write-up.
 
-\subsection*{Day 1 --- 2026-04-05 (Saturday): Training data pipeline and fine-tuning setup}
+\subsection*{Day 3 --- 2026-04-05 (Sunday): Training data pipeline and fine-tuning setup}
 
 \textbf{Summary.} Built the full training data corpus end-to-end and assembled the Unsloth fine-tuning pipeline. Training run is pending a cloud GPU.
 
@@ -258,7 +258,7 @@ This section is the living log of the project. Each day we add a dated entry des
 \item \textbf{Cleanup pass on responses.} Wrote a cleanup script that re-runs Vertex AI generation on empty-thinking records in parallel and applies regex-based drug-name normalization across all responses. After two passes, 3{,}509 of 3{,}511 records (99.94\%) had populated thinking traces, and 28 US brand-name references had been substituted for generics.
 \item \textbf{Training corpus assembly.} Converted the seven response JSONL files into a single shuffled \texttt{train\_holos\_medyk.jsonl} in Unsloth chat format, with each record wrapping the assistant turn in \texttt{<thinking>...</thinking><answer>...</answer>}. Median content length is 2{,}384 characters, 95th-percentile is 3{,}615 characters.
 \item \textbf{Fine-tuning script.} Wrote \texttt{training/train\_holos\_medyk.py}, which loads Gemma 4 E4B in bf16, applies LoRA rank 32 to the seven standard attention and MLP projection targets, runs 3 epochs at effective batch 8 with cosine-decayed 2e-4 learning rate, and exports four artifacts at the end (LoRA adapter, merged bf16, q4\_k\_m GGUF, f16 GGUF).
-\item \textbf{Git hygiene.} Committed the prompt corpus, response corpus, generation and cleanup scripts, and the fine-tuning script as three separate commits. Service account JSON moved out of the repository tree to a private keys directory and added to \texttt{.gitignore}.
+\item \textbf{Git hygiene.} Committed the prompt corpus, response corpus, generation and cleanup scripts, and the fine-tuning script as four separate commits. Service account JSON moved out of the repository tree to a private keys directory and added to \texttt{.gitignore}.
 \end{itemize}
 
 \textbf{What was learned.}
@@ -269,26 +269,97 @@ This section is the living log of the project. Each day we add a dated entry des
 \item Drug naming is a silent but high-impact localization hazard. US models default to US brand names even with an explicit ``international generics only'' system prompt, because the brand names appear in the user prompts the teacher is responding to. A post-hoc regex normalization pass is the simplest fix.
 \end{itemize}
 
-\textbf{What comes next (Day 2).}
+\textbf{What comes next (Day 4).}
 \begin{itemize}
 \item Spin up a RunPod A100 40GB and execute the Unsloth training run.
 \item Run the smoke-test evaluation on the merged model locally before any edge deployment.
 \item Sync the q4\_k\_m GGUF to the Pi and perform a first round of on-device voice interaction tests.
 \end{itemize}
 
-\subsection*{Days prior --- Context from pre-Day-1 git history}
+\subsection*{Day 2 --- 2026-04-04 (Saturday): Native Gemma 4 audio input on the Pi}
 
-The voice pipeline and Flutter application predate the Day 1 entry above and were built over the preceding week. Commit history shows the following progression:
+\textbf{Summary.} Replaced the three-stage Pi voice pipeline (Silero VAD $\rightarrow$ faster-whisper ASR $\rightarrow$ llama.cpp LLM) with a single LiteRT-LM call into Gemma 4 E4B's native audio input. Architecturally this collapses two inference stages into one; the practical result was functional but severely CPU-bound.
 
+\textbf{What was done.}
 \begin{itemize}
-\item \texttt{b540c2b} (initial): Project skeleton, Gemma 4 inference working via LiteRT-LM, Piper text-to-speech working locally.
-\item \texttt{ba5fdff}: End-to-end voice pipeline on the Raspberry Pi: microphone input $\rightarrow$ Silero VAD $\rightarrow$ ASR $\rightarrow$ Gemma 4 $\rightarrow$ Piper $\rightarrow$ speaker.
-\item \texttt{dd428a4}: VAD chunk size fix. Silero requires exactly 512-sample chunks at 16~kHz; an earlier implementation used a different chunk size and failed silently.
-\item \texttt{5ceea4a}: Flutter application scaffolding with LiteRT-LM Gemma 4 integration.
-\item \texttt{5d4804a}: Fixed FlutterGemma initialization and UI layout overflow; switched between E2B and E4B model variants during sizing experiments; fixed VAD in the Flutter voice path.
-\item \texttt{9ca9396}: Full Flutter app scaffolding (Android and iOS targets); settled on E4B as the production model variant.
-\item \texttt{a07c115}: Replaced the separate ASR stage on the Raspberry Pi with Gemma 4's native audio input via LiteRT-LM, simplifying the pipeline component count.
+\item \textbf{Motivation.} On Day 1 the Pi pipeline in \texttt{scripts/pipeline.py} used Silero VAD, faster-whisper for Ukrainian ASR, and a subprocess call to llama.cpp for the language model. The stages were stitched together through temporary WAV files and stdout parsing. A key insight on Day 2 was that Gemma 4 E4B (launched April 2, 2026) includes native multimodal audio understanding as a first-class capability: the model can directly ingest audio tokens and both transcribe and reason over speech in a single forward pass. This promised lower component count, simpler orchestration, and one fewer model to load.
+\item \textbf{New pipeline.} \texttt{scripts/pi\_pipeline.py} was added with a much shorter chain: microphone capture (16~kHz mono float32 via \texttt{sounddevice}) $\rightarrow$ LiteRT-LM Gemma 4 E4B multimodal inference $\rightarrow$ Piper TTS $\rightarrow$ speaker.
+\item \textbf{LiteRT-LM invocation.} The script loads the model via \texttt{litert\_lm.Engine(MODEL\_PATH, audio\_backend=litert\_lm.Backend.CPU)} from the HuggingFace cache path \texttt{\char`~/.cache/huggingface/hub/models--litert-community--gemma-4-E4B-it-litert-lm/.../gemma-4-E4B-it.litertlm}. It creates a conversation and issues a single multimodal message containing both an audio part (\texttt{\{"type":"audio","path":tmp.name\}}) and the Ukrainian first-aid system prompt as a text part. The response returns as model text in one call.
+\item \textbf{What stayed the same.} Piper TTS with the Ukrainian voice (\texttt{uk\_UA-ukrainian\_tts-medium.onnx}), the system prompt, the 16~kHz sampling rate, and the top-level record--process--speak loop with graceful Ctrl+C exit.
+\item \textbf{What was removed.} Silero VAD (replaced with a simple fixed-duration record, default 7 seconds), faster-whisper ASR (replaced by Gemma 4's native audio input), and the llama.cpp subprocess orchestration layer (replaced by direct LiteRT-LM Python calls). The separate \texttt{VoiceRecorder} and ASR classes from Day 1 were consolidated into two small functions (\texttt{record\_audio} and \texttt{save\_audio}).
 \end{itemize}
+
+\textbf{What was learned.}
+\begin{itemize}
+\item Collapsing pipeline stages into a single multimodal model simplifies the code substantially, but the total latency depends entirely on whether that single model can run fast enough. On the Pi 5 8~GB with a CPU-only LiteRT-LM backend, generation took on the order of two minutes per utterance, and TTS synthesis added several more minutes --- effectively $\sim$7 minutes per round trip. The architectural simplification is correct, but the immediate result is unusable without a faster backend.
+\item Removing VAD on Day 2 was a deliberate trade (simpler code at the cost of a quality-of-life feature). This should be reinstated once latency is under control.
+\item LiteRT-LM has backend options beyond CPU. The current invocation hard-codes \texttt{Backend.CPU}; evaluating the XNNPACK and GPU-delegated backends is the obvious next performance lever.
+\end{itemize}
+
+\textbf{Status at end of Day 2.} The new Pi pipeline loads Gemma 4 E4B successfully, accepts voice input in Ukrainian, and produces coherent Ukrainian first-aid responses through Piper. The architecture is validated. Practical latency is far outside the product requirement and must be addressed before deployment tests can begin.
+
+\subsection*{Day 1 --- 2026-04-03 (Friday): Initial stack, desktop voice pipeline, Flutter app scaffolding}
+
+\textbf{Summary.} Took the project from zero to a working end-to-end voice pipeline on the developer workstation, plus a structurally complete Flutter Android application with LiteRT-LM Gemma 4 integration. Eleven commits over roughly three hours, spanning the initial project skeleton through the first full app scaffold.
+
+\textbf{Starting state.} Before any commit the author had drafted \texttt{holos\_medyk\_project\_plan\_FINAL.md} (described in the Day~0 entry below). Everything else was empty.
+
+\textbf{What was done.}
+
+\textit{Initial inference stack} (\texttt{b540c2b}, \texttt{d641150}, \texttt{08bb80e}).
+\begin{itemize}
+\item Created the README, SETUP documentation, and \texttt{requirements.txt} (PyTorch 2.6+, Transformers 4.51+, Piper TTS 1.2+, faster-whisper, sounddevice, soundfile).
+\item Wrote \texttt{scripts/inference.py}, a wrapper around llama.cpp for Gemma 4 E4B and E2B GGUF checkpoints. The wrapper forces \texttt{-ngl 99} (full GPU offload) on the author's RTX A1000 6~GB laptop GPU, supports text/file/interactive invocation modes, and ships a default Ukrainian system prompt positioning the model as ``Holos Medyk.''
+\item Wrote \texttt{scripts/test\_tts.py}, a Piper TTS validation harness that synthesizes six Ukrainian medical emergency phrases using two candidate voices (\texttt{ukrainian\_tts} medium and \texttt{lada} x\_low).
+\item Confirmed E4B inference at $\sim$30 tok/s and E2B at $\sim$60 tok/s on the RTX A1000, with Piper TTS producing acceptable Ukrainian audio end-to-end.
+\item Two quick \texttt{.gitignore} corrections followed to exclude the llama.cpp \texttt{tools/} binaries and the \texttt{test\_output/} scratch directory.
+\end{itemize}
+
+\textit{End-to-end voice pipeline} (\texttt{ba5fdff}, \texttt{dd428a4}).
+\begin{itemize}
+\item \texttt{scripts/pipeline.py} wired together the full voice loop: microphone capture $\rightarrow$ Silero voice activity detection $\rightarrow$ faster-whisper (language=\texttt{uk}) $\rightarrow$ llama.cpp via subprocess $\rightarrow$ Piper TTS $\rightarrow$ \texttt{sounddevice} playback. A \texttt{VoiceRecorder} class drove the capture loop, triggering on VAD confidence $>$0.5 with a 500~ms minimum speech duration and a 1.5~s end-of-utterance silence. A \texttt{--text} fallback flag supported testing without audio hardware.
+\item End-to-end tests confirmed functional Ukrainian voice interaction. Measured round-trip times were $\sim$35 seconds for E4B and $\sim$12 seconds for E2B, with TTS playback adding 3--5 seconds. The latency was known to be unacceptable for production but established that the component chain was correct.
+\item A follow-up commit (\texttt{dd428a4}) fixed a blocking VAD bug: Silero requires frames of exactly 512 samples at 16~kHz (32~ms), not the 30~ms chunks the initial implementation was computing from duration. The fix pinned \texttt{chunk\_samples = 512} and computed duration from the sample count rather than the reverse. This is a recurring pattern with low-level audio ML libraries: the frame-size constraint is non-negotiable and rarely surfaces in tutorials.
+\end{itemize}
+
+\textit{Flutter Android application} (\texttt{5ceea4a}, \texttt{5d4804a}, \texttt{9ca9396}).
+\begin{itemize}
+\item \texttt{5ceea4a} introduced the Flutter app with \texttt{flutter\_gemma} (v0.13.0) driving on-device LiteRT-LM inference. Key files: \texttt{app/lib/main.dart} (Provider-based state container, Material 3 dark medical-green theme), \texttt{app/lib/assistant\_state.dart} (a six-state \texttt{AppPhase} enum: loading, ready, listening, thinking, speaking, error, with Ukrainian status strings), \texttt{app/lib/gemma\_service.dart} (loads the E4B LiteRT-LM model from a HuggingFace URL, \texttt{maxTokens=2048}, \texttt{preferredBackend=PreferredBackend.gpu} to request OpenCL acceleration), and \texttt{app/lib/home\_screen.dart} (dark UI with mic button, scrollable chat, model-loading progress, status bar). The Android manifest declared \texttt{RECORD\_AUDIO} and \texttt{INTERNET} permissions and --- critically --- requested the OpenCL native libraries (\texttt{libOpenCL.so}, \texttt{libOpenCL-car.so}, \texttt{libOpenCL-pixel.so}) with \texttt{required="false"} so that devices with Qualcomm Adreno or ARM Mali GPUs could accelerate inference while devices without fell back gracefully.
+\item \texttt{5d4804a} fixed three bugs that surfaced the first time the APK ran on hardware (a Samsung A15). (1) \texttt{GemmaService.initialize()} was not awaited before \texttt{runApp()}, causing inference attempts against an unloaded model; fixed by making \texttt{main()} async and awaiting initialization. (2) The header \texttt{Row} and status bar overflowed on smaller screens; fixed by wrapping them in \texttt{Expanded}/\texttt{Flexible}. (3) On the Samsung A15 specifically, the mobile GPU was insufficient for meaningful E4B acceleration, so the default model was temporarily switched to E2B to get the app running at all, with the option of E4B retained for flagship devices. The faster-whisper model in the Python pipeline was also upgraded from \texttt{tiny} to \texttt{small} for marginally better Ukrainian accuracy.
+\item \texttt{9ca9396} populated the complete Flutter project scaffolding: Gradle build files, the iOS Xcode project, app icons across all density buckets, launch themes, and a locked \texttt{pubspec.lock}. Sixty-five new files in a single commit. The default model was switched back to E4B with the understanding that a sizing-based fallback to E2B would be implemented as its own concern later.
+\end{itemize}
+
+\textbf{What was learned.}
+\begin{itemize}
+\item Silero VAD has a strict 512-sample frame-size requirement at 16~kHz that is not obvious from introductory material. Computing chunk size from a target duration (e.g.\ 30~ms) rounds to an invalid length and fails silently.
+\item The \texttt{flutter\_gemma} plugin is the path of least resistance for on-device Gemma 4 inference on Android and abstracts most of the LiteRT-LM details, but it hides enough that verifying actual GPU acceleration requires explicit manifest hints and on-device testing.
+\item The mid-range Android device market (4--6~GB RAM, modest GPU) cannot run E4B comfortably. A production release will likely need a sizing-time decision between E4B on flagships and E2B on everything else; tier 1 of the product will probably ship both and select at install time.
+\item E4B at $\sim$30 tok/s on a laptop RTX A1000 is fine for correctness validation but not for real-time voice interaction. The Pi target is expected to be worse. Reducing the total number of inference stages is one of the few available latency levers.
+\end{itemize}
+
+\textbf{Status at end of Day 1.} Desktop end-to-end voice pipeline working in Ukrainian with $\sim$35-second round trips. Flutter app scaffolding complete and running on a real Samsung A15 device, loading the LiteRT-LM model but without integrated voice recording, ASR, or TTS inside the app (a text input dialog stood in as a placeholder). Critical path to the hackathon deadline remained on track.
+
+\subsection*{Day 0 --- Pre-commit: Project plan and design decisions}
+
+\textbf{Summary.} The design of Holos Medyk was completed as a single written plan (\texttt{holos\_medyk\_project\_plan\_FINAL.md}, $\sim$436 lines) before any code was written. The plan makes the problem framing, competitive landscape, hardware choices, model selection, and data strategy explicit. This entry summarizes the pre-implementation decisions that the rest of the changelog is executing against.
+
+\textbf{Problem framing.} When infrastructure collapses and cellular networks fail, injured Ukrainian civilians under bombardment lack access to immediate medical guidance. Static reference apps (Red Cross, IFRC) are not interactive; cloud assistants (Infermedica, AidSnap) are useless when the internet is down; survival-oriented local LLMs (SurviveV3, UltraMedical) are English-only and not specific to warzone trauma; MamayLM, the first Ukrainian LLM, is general-purpose and not deployed on edge devices. The plan documents the absence of any existing product that combines fine-tuned warzone medical reasoning, colloquial Ukrainian, bidirectional voice, and fully offline operation on commodity hardware.
+
+\textbf{Two-tier product strategy.} The primary product is a free Flutter Android app targeting the $\sim$20 million Ukrainians with smartphones: one 4~GB download of quantized Gemma 4 E4B, then fully offline forever on any modern Android device with 6--8~GB of RAM. The secondary product is a Raspberry Pi 5 (8~GB) standalone device for community shelters, hospitals, aid stations, elderly users, and environments where phones are unavailable; a specific bill of materials (CanaKit Pi 5 starter kit, DUNGZDUZ USB microphone, JUOVI 65~W battery bank, WAONIQ speaker) brings the author's prototype cost to \$311.24, with an at-scale target BOM of \$50--75 per unit. Both tiers run identical model weights to simplify validation and reduce duplicated development.
+
+\textbf{Prize targeting.} The plan identifies six hackathon tracks the project is positioned to compete in: Main Track (\$50K / \$25K / \$15K / \$10K), Global Resilience (Impact, \$10K), Cactus (Technology, \$10K), LiteRT (Technology, \$10K), Unsloth (Technology, \$10K), and Safety \& Trust (Impact, \$10K). Theoretical maximum: \$85K. The multi-track positioning reflects the fact that the project has legitimate technical and product strength along multiple axes simultaneously (offline deployment, fine-tuning, medical safety, resilience-oriented impact).
+
+\textbf{Model selection.} Gemma 4 E4B is selected as the primary model: 4.5B effective parameters, 128K context, native multilingual (140+ languages), native audio input, and function calling. E2B (2.3B) is reserved as a fallback for lower-memory devices; E4B's larger 26B and 31B variants are judged too heavy for edge deployment. Launch timing (April 2, 2026, the day before Day 1 development) makes Gemma 4 strategically advantageous for the hackathon.
+
+\textbf{Runtime selection.} LiteRT-LM is chosen as the on-device runtime for both Android and Pi, citing Google's tight Gemma integration and native function-calling support (which will matter for future retrieval-grounded features). llama.cpp is retained as a fallback runtime if LiteRT-LM proves incompatible with the fine-tuned weights.
+
+\textbf{Voice pipeline components.} The plan specifies microphone $\rightarrow$ Gemma 4 native ASR $\rightarrow$ medical reasoning $\rightarrow$ Ukrainian response $\rightarrow$ Piper TTS $\rightarrow$ speaker. ASR is assumed to come from Gemma 4 directly (with Whisper-tiny as a fallback, although project memory notes that Whisper Ukrainian was eventually rejected after native-speaker review). Piper TTS is selected for Ukrainian, with an acknowledged risk that the available voices may sound robotic and require re-evaluation.
+
+\textbf{Data strategy.} The plan proposes an $\sim$80\% English / $\sim$20\% Ukrainian fine-tuning split, leveraging Gemma 4's existing Ukrainian knowledge to produce natural-sounding output while grounding clinical accuracy in English trauma-surgery protocols. Target corpus size: 500--2{,}000 instruction/response pairs, formatted as multi-turn dialogues, plus RAG-ready text chunks. Training framework: Unsloth LoRA/QLoRA on Colab Pro or local GPU. English priorities are ordered by clinical urgency (hemorrhage control, tourniquet application, airway management, crush injuries, burns, shock). Ukrainian priorities include a $\sim$100-term medical terminology glossary, 20--30 emergency dialogue examples, civil defense documents, and civilian phrasing (``скрізь кров'' not ``геморагія''). Note that the actual training corpus built on Day 3 substantially exceeds this plan: 3{,}511 prompt/response/thinking triplets with $\sim$25\% Ukrainian, captured from Gemini 2.5 Pro rather than hand-curated, and with full reasoning traces for distillation.
+
+\textbf{Team and expertise.} The plan identifies three roles: the author as builder (MIT, prior OpenAI red-teaming challenge win, LLM fine-tuning background), a practicing trauma surgeon sibling as clinical advisor (protocol authorship and medical validation), and a native Ukrainian speaker as language and cultural advisor (medical terminology review, ASR validation, connection to family in Ukraine for real-world feedback). This structure deliberately pairs technical depth with authentic clinical and linguistic expertise.
+
+\textbf{Risk register.} The plan documents the known risks explicitly: E4B being too heavy for older Android devices (mitigated by E2B fallback), Gemma 4's Ukrainian ASR quality being inadequate (mitigated by Whisper-tiny fallback, later abandoned), the fine-tuned model hallucinating dangerous advice (mitigated by brother review, system-prompt guardrails, and RAG grounding), English training failing to transfer to Ukrainian output (mitigated by early-stage Ukrainian examples), Android port delays (mitigated by prioritizing the Pi demo as a submission backup), Piper voice quality (evaluate alternatives), LiteRT-LM incompatibility with fine-tuned weights (fallback to llama.cpp), and advisor unavailability. A critical-path checklist identifies E4B running on the Pi by April 6, Ukrainian speech-to-text by April 7, text-to-speech by April 7, and an end-to-end voice loop by April 9; these checkpoints are the hackathon go/no-go gates.
 
 \section{Open Questions}
 
