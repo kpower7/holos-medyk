@@ -58,3 +58,7 @@ test_output/
 
 # HuggingFace cache
 .cache/
+
+# Google Cloud service account keys
+*gen-lang-client*.json
+service-account*.json
