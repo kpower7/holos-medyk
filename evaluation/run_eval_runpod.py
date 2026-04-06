@@ -3,11 +3,13 @@ Holos Medyk — Benchmark: Base vs Fine-tuned on RunPod A100.
 Run both models, print side-by-side, save results.
 
 Usage:
+    pip install transformers peft accelerate sentencepiece
     cd /workspace/holos-medyk
     python evaluation/run_eval_runpod.py
 """
-from unsloth import FastLanguageModel
 import torch, time, json
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
 
 SCENARIOS = [
     {"id": "hemorrhage_01", "category": "hemorrhage", "lang": "en",
@@ -64,16 +66,16 @@ def run_benchmark(model, tokenizer, tag):
     results = []
     for i, s in enumerate(SCENARIOS):
         print(f"\n[{i+1}/{len(SCENARIOS)}] {s['id']} ({s['lang']})")
-        print(f"  Prompt: {s['prompt'][:80]}...")
+        print(f"  Prompt: {s['prompt'][:80]}...", flush=True)
         messages = [{"role": "user", "content": f"{SYSTEM_PROMPT}\n\n{s['prompt']}"}]
-        inputs = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True, return_dict=True).to(model.device)
+        input_ids = tokenizer.apply_chat_template(messages, return_tensors="pt", add_generation_prompt=True).to(model.device)
         start = time.time()
         with torch.no_grad():
-            output = model.generate(**inputs, max_new_tokens=512, temperature=0.3, do_sample=True, top_p=0.9)
+            output = model.generate(input_ids=input_ids, max_new_tokens=512, temperature=0.3, do_sample=True, top_p=0.9)
         elapsed = time.time() - start
-        response = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        response = tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True)
         results.append({"id": s["id"], "category": s["category"], "lang": s["lang"], "prompt": s["prompt"], "key_criteria": s["key_criteria"], "response": response, "elapsed": round(elapsed, 1), "tag": tag})
-        print(f"  Response ({elapsed:.1f}s): {response[:200]}...")
+        print(f"  Response ({elapsed:.1f}s): {response[:200]}...", flush=True)
     return results
 
 
@@ -84,20 +86,23 @@ def main():
     # --- BASELINE ---
     print("=" * 80)
     print("BASELINE: google/gemma-4-E4B-it")
-    print("=" * 80)
-    base_model, base_tok = FastLanguageModel.from_pretrained("google/gemma-4-E4B-it", max_seq_length=2048, load_in_4bit=True)
-    FastLanguageModel.for_inference(base_model)
+    print("=" * 80, flush=True)
+    base_tok = AutoTokenizer.from_pretrained("google/gemma-4-E4B-it")
+    base_model = AutoModelForCausalLM.from_pretrained("google/gemma-4-E4B-it", torch_dtype=torch.bfloat16, device_map="auto")
+    base_model.eval()
     baseline = run_benchmark(base_model, base_tok, "baseline")
     del base_model, base_tok; gc.collect(); torch.cuda.empty_cache()
 
     # --- FINE-TUNED ---
     print("\n" + "=" * 80)
-    print("FINE-TUNED: kevpower/holos-medyk-lora")
-    print("=" * 80)
-    ft_model, ft_tok = FastLanguageModel.from_pretrained("kevpower/holos-medyk-lora", max_seq_length=2048, load_in_4bit=True)
-    FastLanguageModel.for_inference(ft_model)
+    print("FINE-TUNED: kevpower/holos-medyk-lora on top of google/gemma-4-E4B-it")
+    print("=" * 80, flush=True)
+    ft_tok = AutoTokenizer.from_pretrained("google/gemma-4-E4B-it")
+    ft_base = AutoModelForCausalLM.from_pretrained("google/gemma-4-E4B-it", torch_dtype=torch.bfloat16, device_map="auto")
+    ft_model = PeftModel.from_pretrained(ft_base, "kevpower/holos-medyk-lora")
+    ft_model.eval()
     finetuned = run_benchmark(ft_model, ft_tok, "finetuned")
-    del ft_model, ft_tok; gc.collect(); torch.cuda.empty_cache()
+    del ft_model, ft_base, ft_tok; gc.collect(); torch.cuda.empty_cache()
 
     # --- COMPARISON ---
     print("\n" + "=" * 80)
