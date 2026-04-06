@@ -26,7 +26,7 @@ TRAIN_FILE = "data/training/train_holos_medyk.jsonl"
 OUTPUT_DIR = "training/outputs/holos_medyk_gemma4_e4b"
 MAX_SEQ_LENGTH = 2048
 LORA_RANK = 32
-LORA_ALPHA = 32
+LORA_ALPHA = 64
 LEARNING_RATE = 2e-4
 NUM_EPOCHS = 3
 BATCH_SIZE = 2
@@ -36,6 +36,29 @@ SEED = 42
 
 
 def main():
+    # Setup Weights & Biases logging
+    try:
+        import wandb
+        wandb.init(
+            project="holos-medyk",
+            name="gemma4-e4b-sft-stage1",
+            config={
+                "model": MODEL_NAME,
+                "lora_rank": LORA_RANK,
+                "lora_alpha": LORA_ALPHA,
+                "learning_rate": LEARNING_RATE,
+                "epochs": NUM_EPOCHS,
+                "batch_size": BATCH_SIZE,
+                "grad_accum": GRAD_ACCUM,
+                "max_seq_length": MAX_SEQ_LENGTH,
+            },
+        )
+        report_to = "wandb"
+        print("Logging to Weights & Biases")
+    except ImportError:
+        report_to = "none"
+        print("wandb not installed, logging to stdout only")
+
     print(f"Loading {MODEL_NAME}...")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
@@ -114,12 +137,31 @@ def main():
             seed=SEED,
             bf16=torch.cuda.is_bf16_supported(),
             fp16=not torch.cuda.is_bf16_supported(),
-            report_to="none",
+            report_to=report_to,
         ),
     )
 
     print("\nStarting training...")
-    trainer.train()
+    result = trainer.train()
+
+    # Save training metrics to CSV as backup
+    import json
+    metrics_path = f"{OUTPUT_DIR}/training_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump({
+            "train_loss": result.training_loss,
+            "train_runtime": result.metrics.get("train_runtime"),
+            "train_samples_per_second": result.metrics.get("train_samples_per_second"),
+            "total_steps": result.global_step,
+            "epochs": NUM_EPOCHS,
+        }, f, indent=2)
+    print(f"Training metrics saved to {metrics_path}")
+
+    # Also save full log history
+    log_path = f"{OUTPUT_DIR}/training_log.json"
+    with open(log_path, "w") as f:
+        json.dump(trainer.state.log_history, f, indent=2)
+    print(f"Full training log saved to {log_path}")
 
     print("\nSaving LoRA adapter...")
     model.save_pretrained(f"{OUTPUT_DIR}/lora_adapter")

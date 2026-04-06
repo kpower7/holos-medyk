@@ -62,3 +62,19 @@ test_output/
 # Google Cloud service account keys
 *gen-lang-client*.json
 service-account*.json
+
+# Reference PDFs (large, copyrighted)
+data/references/*.pdf
+data/references/*.txt
+
+# TTS model artifacts (downloaded during comparison tests)
+model.pth
+config.yaml
+feats_stats.npz
+spk_xvector.ark
+
+# Training outputs (large model files)
+training/outputs/
+
+# Kaggle notebook exports
+tunix-final-submission-the-idea-e-framework.*
