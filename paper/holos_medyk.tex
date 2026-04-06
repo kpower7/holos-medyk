@@ -246,7 +246,7 @@ This section is the living log of the project. Each day we add a dated entry des
 
 \subsection*{Day 4 --- 2026-04-06 (Sunday): Clinical research, TTS crisis, hardware pivot, and product scope expansion}
 
-\textbf{Summary.} A research-and-strategy day that reshaped three major axes of the project: (1) deep clinical research grounded in the trauma surgeon's first substantive input produced a 3{,}000-word reference document that will restructure the training data around MARCH rather than ABC; (2) a corrected attribution of the Day~2 native-speaker rejection --- the problem was Piper TTS, not Whisper ASR --- triggered a full TTS engine comparison; (3) the Jetson Orin Nano Super was ordered as a replacement for the Raspberry Pi~5 as the primary edge target; and (4) the product scope was expanded from medical-only to general emergency assistance (CBRN, structural safety, water, communication). No model training occurred; the day was deliberately spent ensuring the training data strategy is correct before committing GPU hours.
+\textbf{Summary.} The most technically dense day of the project so far, spanning ten workstreams: (1) formalized the three-stage training curriculum (Stage~1 SFT on existing data for medical knowledge, Stage~2 SFT on MARCH-structured polytrauma/CBRN data, Stage~3 GRPO on surgeon's golden dataset); (2) deep clinical research grounded in the trauma surgeon's first substantive input produced a 3{,}000-word reference document restructuring training around MARCH instead of ABC; (3) corrected the Day~2 native-speaker rejection attribution --- Piper TTS was broken, not Whisper ASR; (4) built and ran a TTS engine comparison (80~WAV files across Piper, Silero, robinhad/ukrainian-tts) for native-speaker evaluation; (5) ordered the Jetson Orin Nano Super (\$249) as Pi~5 replacement; (6) expanded product scope from medical-only to general emergency assistance (CBRN, structural safety, communication); (7) completed Stage~1 SFT training on RunPod A100 80GB (final loss 0.72, models uploaded to HuggingFace); (8) designed a 15-scenario evaluation benchmark and ran baseline vs fine-tuned comparison; (9) analyzed benchmark results --- fine-tuned model fixes critical baseline errors (shock water, morphine dosing, crush syndrome) but introduces generation looping and over-refusal; (10) built a data cleanup pipeline stripping thinking tags and regenerating 172 refusal examples via DeepSeek R1 for Stage~2 training.
 
 \textbf{What was done.}
 
@@ -294,19 +294,68 @@ This section is the living log of the project. Each day we add a dated entry des
 \item The existing 3{,}511 training examples are retained as-is for Stage~1 SFT --- they represent \$50 of high-quality Gemini~2.5 Pro inference and contain sound medical knowledge, civilian-facing tone, and Ukrainian language grounding. Rather than regenerating them, a second round of $\sim$1{,}100 \emph{additional} prompts will be generated for Stage~2 SFT, covering: polytrauma scenarios ($\sim$300), CBRN/chemical ($\sim$200), survival/safety ($\sim$300), MARCH-structured multi-injury assessments ($\sim$200), and myth-busting/corrective examples ($\sim$100). The three-stage curriculum is: Stage~1 SFT on the existing corpus (medical knowledge), Stage~2 SFT on the MARCH-structured corpus (correct assessment ordering and scope expansion), Stage~3 GRPO/DPO on the surgeon's golden dataset (protocol precision).
 \end{itemize}
 
+\textit{Stage~1 SFT training on RunPod.}
+\begin{itemize}
+\item Rented an A100 SXM 80GB on RunPod (\$1.49/hr). Cloned the repository, installed Unsloth (which confirmed Gemma~4 support out of the box), set \texttt{HF\_HOME} to the 100GB volume disk after an initial disk-full error on the 20GB container disk, and launched training.
+\item Training completed 3 epochs over 3{,}511 examples in approximately 35 minutes (2{,}115 seconds). Final training loss: \textbf{0.72}, down from $\sim$10 at initialization. 84.8M trainable parameters out of 8.0B total (1.05\% trained via LoRA rank~32). Effective batch size~8 (2 per device $\times$ 4 gradient accumulation). Learning rate 2e-4 with cosine decay.
+\item LoRA adapter (357~MB) and merged bf16 weights (15~GB) saved successfully. GGUF export failed because Unsloth's automatic \texttt{llama.cpp} installation requires interactive confirmation which was blocked by \texttt{nohup}. GGUF conversion deferred to local laptop via \texttt{llama.cpp}'s \texttt{convert\_hf\_to\_gguf.py}.
+\item Both artifacts uploaded to HuggingFace: \texttt{kevpower/holos-medyk-lora} (adapter) and \texttt{kevpower/holos-medyk-merged} (full merged weights).
+\item Weights \& Biases logging captured the training run (project \texttt{holos-medyk}, run \texttt{gemma4-e4b-sft-stage1}).
+\item Total RunPod cost: approximately \$3--4 (pod running $\sim$2.5 hours including setup, download, training, merge, and upload).
+\end{itemize}
+
+\textit{Evaluation benchmark design and baseline execution.}
+\begin{itemize}
+\item Designed a 15-scenario evaluation benchmark (\texttt{evaluation/eval\_scenarios.jsonl}) covering hemorrhage (2), airway (2), chest wound (1), tension pneumothorax (1), shock (2), triage (1), burns (1), crush injury (1), safety refusal (2), polytrauma (1), scene safety (1), and psychological crisis (1). Each scenario includes a realistic civilian prompt, language tag (English or Ukrainian), and a list of key clinical criteria the response must address.
+\item Baseline evaluation executed against the unmodified \texttt{google/gemma-4-E4B-it} base model. Fine-tuned evaluation pending GGUF conversion of the merged weights.
+\item Attempted to run both baseline and fine-tuned benchmarks on Kaggle T4 GPUs. Multiple failures: PEFT's LoRA injection crashed on Gemma~4's \texttt{Gemma4ClippableLinear} (a custom module not in PEFT's allowlist), Unsloth failed to install on Kaggle due to \texttt{bitsandbytes} conflicts, and the T4's lack of bf16 support caused Unsloth to fall back to float32 (OOM on 16~GB). After roughly three hours of environment debugging, the approach was simplified: load the pre-merged model directly via \texttt{AutoModelForCausalLM} on a second RunPod A100 with no PEFT or Unsloth dependency at all.
+\item Benchmark completed successfully on RunPod A100 80GB. Baseline average: 11.8s per scenario. Fine-tuned average: 39.8s (inflated by thinking-trace generation, see below).
+\end{itemize}
+
+\textit{Benchmark results and analysis.}
+\begin{itemize}
+\item The fine-tuned model showed clear improvements on clinical correctness versus baseline on multiple critical scenarios:
+  \begin{itemize}
+  \item \textbf{Shock management}: baseline incorrectly advises ``give small sips of water'' to a shock patient (potentially lethal); fine-tuned correctly refuses water.
+  \item \textbf{Morphine dosing}: baseline says ``check the packaging'' (fails to refuse unsafe self-administration); fine-tuned properly redirects to non-pharmacological pain management.
+  \item \textbf{Crush syndrome}: baseline gives generic ``lift slowly'' advice, completely missing the crush-release lethality risk; fine-tuned says ``do NOT lift the beam yet'' and instructs tourniquet application before release.
+  \item \textbf{Hemorrhage with embedded glass}: fine-tuned specifically explains ``the glass is plugging the wound''; baseline gives generic pressure advice.
+  \item \textbf{Triage ordering, burns, scene safety}: both models perform comparably well.
+  \end{itemize}
+\item Two critical problems identified in the fine-tuned model requiring Stage~2 fixes:
+  \begin{itemize}
+  \item \textbf{Generation looping}: the model produces \texttt{</answer><thinking><answer>} cycles, repeating its response 2--4 times until hitting the \texttt{max\_new\_tokens} limit. Every fine-tuned response took exactly 39.8s (the token ceiling) rather than stopping naturally. Root cause: the training data included \texttt{<thinking>...<answer>...</answer>} markup, and the model learned to produce these tags as literal output rather than internalizing the reasoning.
+  \item \textbf{Over-refusal}: the model learned to say ``I cannot provide instructions on administering opioids'' from 172 training examples containing refusal patterns (``I cannot,'' ``see a doctor,'' ``seek professional help''). This directly contradicts the product's purpose --- when no medical help is available, refusing to guide is equivalent to letting the patient die.
+  \end{itemize}
+\end{itemize}
+
+\textit{Training data cleanup for Stage~2.}
+\begin{itemize}
+\item Wrote \texttt{training/fix\_training\_data.py} to address both problems:
+  \begin{enumerate}
+  \item \textbf{Tag stripping}: removed all \texttt{<thinking>} and \texttt{<answer>} tags from 3{,}511 training examples, keeping only the answer content as the model's target output. The reasoning knowledge is retained in the model weights from Stage~1; Stage~2 trains on clean direct responses only.
+  \item \textbf{Refusal replacement}: identified 172 examples containing refusal patterns and regenerated them via DeepSeek R1 API with a system prompt enforcing ``never refuse, always guide safely.'' Cost: $\sim$\$1--2.
+  \end{enumerate}
+\item System prompts across all examples updated to include ``Never refuse to help'' as an explicit instruction.
+\item Output: \texttt{train\_holos\_medyk\_v2.jsonl} --- same 3{,}511 examples, no thinking tags, no refusals, shuffled.
+\end{itemize}
+
 \textbf{What was learned.}
 \begin{itemize}
 \item \textbf{Misattributed failures are expensive.} The Day~2 rejection of Whisper ASR was actually a rejection of Piper TTS. This error persisted in project memory and the paper for two days, incorrectly closing off Whisper as an ASR option and masking the real problem (TTS). The lesson: when a native speaker says ``it sounds wrong,'' disambiguate \emph{which component} sounds wrong before recording the verdict.
 \item \textbf{Clinical frameworks from domain experts need cross-referencing.} The trauma surgeon provided ABC as the universal algorithm, which is clinically correct in a hospital context. But for a warzone civilian product, the MARCH reordering (hemorrhage first) is the evidence-based standard and matches what Ukrainian civilians are already being trained on. Domain expert input is necessary but not sufficient; it must be situated in the deployment context.
-\item \textbf{The training data gap is in scenario structure, not volume.} The existing 3{,}511 examples have good individual-injury coverage but almost no polytrauma, no MARCH ordering, no CBRN, and no general survival. Adding 1{,}100 targeted examples to fill these gaps is more valuable than scaling to 10{,}000 examples of the same type.
+\item \textbf{Thinking-trace markup in training data causes generation loops.} The model learns to literally output \texttt{<thinking>} and \texttt{<answer>} tags and then cycles between them. For reasoning distillation, the thinking content should be merged into the response naturally without structural markup, or stripped entirely with reasoning treated as an implicit capability baked into weights.
+\item \textbf{Refusal training is the opposite of what this product needs.} Standard safety fine-tuning teaches ``I cannot help with that.'' A warzone medical assistant must never refuse --- the user has no alternative. Training data must replace refusals with risk-aware guidance: ``This is dangerous. Here is how to do it as safely as possible.''
+\item \textbf{Cloud training is cheap; cloud inference tooling is fragile.} The A100 training run cost $\sim$\$3--4 and completed in 35 minutes. Getting inference to work on Kaggle's T4 consumed three hours due to cascading dependency conflicts (Unsloth/PEFT/bitsandbytes/Gemma~4 \texttt{ClippableLinear}). The eventual solution was trivial: load the merged model directly, no adapter libraries needed. The lesson: the simplest approach that could possibly work should be tried first.
 \item \textbf{Edge GPU changes the product category.} The Pi~5 at $\sim$2-minute text latency is a proof of concept. The Jetson at $\sim$35~tok/s is a product. The \$249 price point is comparable to what we paid for the Pi developer kit (\$279) while delivering 10--20$\times$ better inference performance.
+\item \textbf{Always run long training jobs with \texttt{nohup}.} The first training attempt crashed when the author's laptop went to sleep and the RunPod web terminal disconnected. Future runs use \texttt{nohup python train.py > log.txt 2>\&1 \&}.
 \end{itemize}
 
 \textbf{What comes next (Day 5).}
 \begin{itemize}
 \item Receive Diana's TTS evaluation results and select the production Ukrainian voice.
-\item Spin up a RunPod A100 40GB and execute the Unsloth training run on the existing 3{,}511-example corpus (first pass, before MARCH restructuring).
-\item Begin the second round of training data generation (polytrauma, CBRN, MARCH-structured).
+\item Run Stage~2 SFT on the cleaned \texttt{v2} dataset (no thinking tags, no refusals) and re-benchmark.
+\item Begin round~2 training data generation (polytrauma, CBRN, MARCH-structured, $\sim$1{,}100 additional prompts).
 \item When the Jetson arrives, bring up \texttt{llama.cpp} with CUDA and benchmark Gemma~4 E2B/E4B inference.
 \end{itemize}
 
