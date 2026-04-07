@@ -1,0 +1,15 @@
+{
+  "id": "kevinpowerscm/holos-medyk-benchmark",
+  "title": "holos-medyk-benchmark",
+  "code_file": "benchmark_notebook.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "keywords": ["gemma", "medical", "ukrainian", "fine-tuning"],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}

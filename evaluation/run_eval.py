@@ -34,34 +34,39 @@ SYSTEM_PROMPT = """You are Holos Medyk, a Ukrainian warzone medical voice assist
 
 def run_inference(model_path: Path, prompt: str, system_prompt: str) -> tuple[str, float]:
     """Run a single inference via llama-cli and return (response, seconds)."""
-    # Write prompt to temp file to avoid encoding issues
+    # Write prompt to temp file to handle Ukrainian text encoding
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-        f.write(f"[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{prompt} [/INST]")
+        f.write(prompt)
         prompt_file = f.name
 
     try:
+        env = os.environ.copy()
+        env["PATH"] = str(LLAMA_CLI.parent) + os.pathsep + env.get("PATH", "")
         start = time.time()
         result = subprocess.run(
             [
                 str(LLAMA_CLI),
-                "-m", str(model_path),
+                "-m", str(model_path.resolve()),
                 "-ngl", "99",
                 "-f", prompt_file,
                 "-n", "512",
                 "--temp", "0.3",
-                "--no-cnv",
+                "-sys", system_prompt,
                 "--single-turn",
+                "--no-cnv",
             ],
             capture_output=True,
-            text=True,
-            timeout=120,
+            timeout=300,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
         elapsed = time.time() - start
-        return result.stdout.strip(), elapsed
+        # Response is on stdout; stderr has the model loading logs
+        response = result.stdout.strip()
+        return response, elapsed
     except subprocess.TimeoutExpired:
-        return "[TIMEOUT after 120s]", 120.0
+        return "[TIMEOUT after 300s]", 300.0
     except Exception as e:
         return f"[ERROR: {e}]", 0.0
     finally:

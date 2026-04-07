@@ -3,6 +3,15 @@ from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 import torch, os, json
 
+try:
+    import wandb
+    wandb.init(project="holos-medyk", name="gemma4-e4b-sft-stage1-resumed")
+    report_to = "wandb"
+    print("Logging to wandb")
+except ImportError:
+    report_to = "none"
+    print("wandb not found, logging to stdout")
+
 MODEL_NAME = "google/gemma-4-E4b-it"
 CHECKPOINT = "training/outputs/holos_medyk_gemma4_e4b/checkpoint-400"
 OUTPUT_DIR = "training/outputs/holos_medyk_gemma4_e4b"
@@ -32,7 +41,7 @@ trainer = SFTTrainer(
         weight_decay=0.01, seed=42,
         bf16=torch.cuda.is_bf16_supported(),
         fp16=not torch.cuda.is_bf16_supported(),
-        report_to="none",
+        report_to=report_to,
     ),
 )
 
