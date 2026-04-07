@@ -371,16 +371,30 @@ This section is the living log of the project. Each day we add a dated entry des
 \begin{itemize}
 \item Diana (native Ukrainian speaker) evaluated 80~WAV files across 10 voices from 3 engines. Winner: \textbf{robinhad/ukrainian-tts, Tetiana voice}, followed by Dmytro as second choice.
 \item Robinhad runs on PyTorch/ESPnet --- viable on Jetson (CUDA) and Pi~5 (CPU, slower), but not directly deployable on Android without an ONNX export (which does not currently exist). Silero (ONNX, runs everywhere) remains the fallback for mobile.
-\item Decision: use Robinhad Tetiana on Jetson/Pi, evaluate Silero on Android separately.
+\item Decision: use Robinhad Tetiana on Jetson (PyTorch/CUDA), Silero v5 \texttt{ukr\_roman} on Pi/Android/iOS (ONNX via Sherpa-ONNX).
+\end{itemize}
+
+\textit{Curated training dataset (v3).}
+\begin{itemize}
+\item Following the strategy pivot away from large-scale synthetic SFT, a curated dataset of 266 high-quality training examples was generated using Claude Code subagents in batches of 10, with three rounds of quality auditing and targeted fixes. The dataset is organized into five categories:
+  \begin{itemize}
+  \item \textbf{Category 1 --- Refusal override (60 examples)}: scenarios where a standard AI refuses but Holos Medyk provides risk-aware guidance (morphine dosing, needle decompression, field childbirth, improvised cricothyrotomy, blood transfusion, etc.).
+  \item \textbf{Category 2 --- MARCH-ordered polytrauma (80 examples)}: multi-injury scenarios (2--4 simultaneous injuries) where the response follows strict MARCH ordering (hemorrhage first). Covers apartment strikes, drone attacks, shelter collapses, school bombings, cluster munitions, factory explosions, and more.
+  \item \textbf{Category 3 --- Corrective (40 examples)}: explicit corrections for errors the base model makes --- shock/water, three-sided chest seal, crush syndrome, tourniquet myths, nosebleed head-tilt, seizure mouth-object, elevation-only bleeding, flat-on-back unconscious, adult CPR on children.
+  \item \textbf{Category 4 --- Ukrainian language (57 examples)}: colloquial Ukrainian emergency dialogues covering mine injuries, childbirth, chemical exposure, crush syndrome, electrocution, dog bites, diabetic emergencies, and more.
+  \item \textbf{Category 5 --- Clean stop behavior (29 examples)}: short 2--4 sentence responses that end definitively, training the model to stop generating after the actionable guidance is complete.
+  \end{itemize}
+\item Three rounds of quality auditing identified and fixed: one reversed snake-bite bandage direction, one remaining three-sided chest seal, a dangerously short double-tap wait time (30 seconds $\rightarrow$ 5 minutes), an incorrect tourniquet time limit (2 hours $\rightarrow$ 6+ hours), three MARCH-order violations, a head-tilt on blast victim (changed to jaw thrust), a missing Rh factor warning on field transfusion, four duplicate scenarios, and two examples with outdated ``no painkillers for appendicitis'' advice.
+\item Language split: 56\% Ukrainian, 44\% English. Average response length: 126 words. Final dataset: \texttt{data/training/train\_holos\_medyk\_v3\_curated.jsonl}.
 \end{itemize}
 
 \textbf{What comes next (Day 5).}
 \begin{itemize}
-\item Design and curate a small, high-quality training dataset ($\sim$200--500 examples) targeting specific behavior changes from baseline: never-refuse, MARCH ordering, chest seal technique, crush syndrome, polytrauma.
-\item Get brother's first batch of golden examples for GRPO/DPO.
-\item Integrate Robinhad Tetiana TTS into the Pi and Jetson voice pipelines, replacing Piper.
+\item Run Stage~3 SFT on the v3 curated dataset (266 examples) on RunPod and benchmark against baseline.
+\item Get brother's first batch of golden examples for GRPO/DPO refinement.
+\item Integrate Robinhad Tetiana TTS on Jetson, Silero \texttt{ukr\_roman} on Pi/Android/iOS.
 \item When the Jetson arrives, bring up \texttt{llama.cpp} with CUDA and benchmark Gemma~4 E2B/E4B inference.
-\item Fix \texttt{llama-cli.exe} on the laptop --- binary crashes silently despite working on Day~1.
+\item Fix \texttt{llama-cli.exe} on the laptop.
 \end{itemize}
 
 \subsection*{Day 3 --- 2026-04-05 (Sunday): Training data pipeline and fine-tuning setup}

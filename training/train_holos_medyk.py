@@ -22,7 +22,7 @@ from transformers import TrainingArguments
 
 # --- Config ---
 MODEL_NAME = "google/gemma-4-E4b-it"
-TRAIN_FILE = "data/training/train_holos_medyk_v2.jsonl"
+TRAIN_FILE = "data/training/train_holos_medyk_v3_curated.jsonl"
 OUTPUT_DIR = "training/outputs/holos_medyk_gemma4_e4b"
 MAX_SEQ_LENGTH = 2048
 LORA_RANK = 32
