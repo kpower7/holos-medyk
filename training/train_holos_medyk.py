@@ -1,38 +1,34 @@
 """
 Fine-tune Gemma 4 E4B on Holos Medyk training data using Unsloth.
 
-Training format: <thinking>...</thinking><answer>...</answer>
-The thinking traces come from Gemini 3 Pro — this is reasoning distillation.
-At inference time we prompt the model to skip <thinking> and go straight to <answer>
-for fast voice response on the Pi, while the reasoning capability is baked into weights.
+Uses FastModel (not FastLanguageModel) with finetune_vision_layers=False
+to ensure LoRA only targets the text decoder, not vision/audio encoders.
 
 Usage (on a GPU box, e.g. A100 on RunPod):
     pip install unsloth
     python train_holos_medyk.py
 
-Expected runtime: ~1-2 hours on a single A100 40GB.
+Expected runtime: ~5-10 minutes on A100 with 266 examples.
 """
 
 import os
 import torch
-from unsloth import FastLanguageModel
+from unsloth import FastModel
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
-from transformers import TrainingArguments
 
 # --- Config ---
-MODEL_NAME = "google/gemma-4-E4b-it"
+MODEL_NAME = "unsloth/gemma-4-E4B-it"
 TRAIN_FILE = "data/training/train_holos_medyk_v3_curated.jsonl"
 OUTPUT_DIR = "training/outputs/holos_medyk_gemma4_e4b"
 MAX_SEQ_LENGTH = 2048
 LORA_RANK = 8
-LORA_ALPHA = 16
-LEARNING_RATE = 5e-6
-NUM_EPOCHS = 2
+LORA_ALPHA = 8
+LEARNING_RATE = 2e-4
+MAX_STEPS = 60
 BATCH_SIZE = 2
 GRAD_ACCUM = 4  # effective batch = 8
-WARMUP_RATIO = 0.1
-SEED = 42
+SEED = 3407
 
 
 def main():
@@ -41,47 +37,46 @@ def main():
         import wandb
         wandb.init(
             project="holos-medyk",
-            name="gemma4-e4b-sft-stage1",
+            name="gemma4-e4b-sft-v5-textonly",
             config={
                 "model": MODEL_NAME,
                 "lora_rank": LORA_RANK,
                 "lora_alpha": LORA_ALPHA,
                 "learning_rate": LEARNING_RATE,
-                "epochs": NUM_EPOCHS,
+                "max_steps": MAX_STEPS,
                 "batch_size": BATCH_SIZE,
                 "grad_accum": GRAD_ACCUM,
                 "max_seq_length": MAX_SEQ_LENGTH,
+                "finetune_vision_layers": False,
+                "finetune_language_layers": True,
             },
         )
         report_to = "wandb"
         print("Logging to Weights & Biases")
-    except ImportError:
+    except (ImportError, Exception):
         report_to = "none"
-        print("wandb not installed, logging to stdout only")
+        print("wandb not available, logging to stdout only")
 
     print(f"Loading {MODEL_NAME}...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    model, tokenizer = FastModel.from_pretrained(
         model_name=MODEL_NAME,
         max_seq_length=MAX_SEQ_LENGTH,
-        load_in_4bit=False,
-        load_in_16bit=True,
+        load_in_4bit=True,
         full_finetuning=False,
     )
 
-    print("Applying LoRA...")
-    model = FastLanguageModel.get_peft_model(
+    print("Applying LoRA (text layers only, vision/audio frozen)...")
+    model = FastModel.get_peft_model(
         model,
+        finetune_vision_layers=False,
+        finetune_language_layers=True,
+        finetune_attention_modules=True,
+        finetune_mlp_modules=True,
         r=LORA_RANK,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
         lora_alpha=LORA_ALPHA,
         lora_dropout=0,
         bias="none",
-        use_gradient_checkpointing="unsloth",
         random_state=SEED,
-        max_seq_length=MAX_SEQ_LENGTH,
     )
 
     print(f"Loading dataset from {TRAIN_FILE}...")
@@ -99,19 +94,10 @@ def main():
 
     dataset = dataset.map(format_example, remove_columns=dataset.column_names)
 
-    # Quick sanity check on the first formatted example
+    # Quick sanity check
     print("\n=== First formatted training example ===")
     print(dataset[0]["text"][:1500])
-    print("...")
-    print()
-
-    # Steps per epoch
-    effective_batch = BATCH_SIZE * GRAD_ACCUM
-    steps_per_epoch = len(dataset) // effective_batch
-    total_steps = steps_per_epoch * NUM_EPOCHS
-    warmup_steps = int(total_steps * WARMUP_RATIO)
-    print(f"Effective batch size: {effective_batch}")
-    print(f"Steps/epoch: {steps_per_epoch}, Total steps: {total_steps}, Warmup: {warmup_steps}")
+    print("...\n")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -124,16 +110,16 @@ def main():
             max_seq_length=MAX_SEQ_LENGTH,
             per_device_train_batch_size=BATCH_SIZE,
             gradient_accumulation_steps=GRAD_ACCUM,
-            num_train_epochs=NUM_EPOCHS,
-            warmup_steps=warmup_steps,
+            max_steps=MAX_STEPS,
+            warmup_steps=5,
             learning_rate=LEARNING_RATE,
-            lr_scheduler_type="cosine",
-            logging_steps=10,
-            save_steps=200,
-            save_total_limit=3,
+            lr_scheduler_type="linear",
+            logging_steps=5,
+            save_steps=30,
+            save_total_limit=2,
             output_dir=OUTPUT_DIR,
             optim="adamw_8bit",
-            weight_decay=0.01,
+            weight_decay=0.001,
             seed=SEED,
             bf16=torch.cuda.is_bf16_supported(),
             fp16=not torch.cuda.is_bf16_supported(),
@@ -141,10 +127,10 @@ def main():
         ),
     )
 
-    print("\nStarting training...")
+    print(f"\nStarting training ({MAX_STEPS} steps)...")
     result = trainer.train()
 
-    # Save training metrics to CSV as backup
+    # Save metrics
     import json
     metrics_path = f"{OUTPUT_DIR}/training_metrics.json"
     with open(metrics_path, "w") as f:
@@ -153,11 +139,13 @@ def main():
             "train_runtime": result.metrics.get("train_runtime"),
             "train_samples_per_second": result.metrics.get("train_samples_per_second"),
             "total_steps": result.global_step,
-            "epochs": NUM_EPOCHS,
+            "max_steps": MAX_STEPS,
+            "lora_rank": LORA_RANK,
+            "learning_rate": LEARNING_RATE,
+            "finetune_vision_layers": False,
         }, f, indent=2)
     print(f"Training metrics saved to {metrics_path}")
 
-    # Also save full log history
     log_path = f"{OUTPUT_DIR}/training_log.json"
     with open(log_path, "w") as f:
         json.dump(trainer.state.log_history, f, indent=2)
@@ -174,23 +162,17 @@ def main():
         save_method="merged_16bit",
     )
 
-    print("\nExporting to GGUF (q4_k_m for Pi, f16 for quality reference)...")
+    print("\nExporting to GGUF (q4_k_m)...")
     model.save_pretrained_gguf(
         f"{OUTPUT_DIR}/gguf_q4_k_m",
         tokenizer,
         quantization_method="q4_k_m",
     )
-    model.save_pretrained_gguf(
-        f"{OUTPUT_DIR}/gguf_f16",
-        tokenizer,
-        quantization_method="f16",
-    )
 
     print(f"\n=== DONE ===")
     print(f"LoRA adapter: {OUTPUT_DIR}/lora_adapter")
     print(f"Merged 16bit: {OUTPUT_DIR}/merged_16bit")
-    print(f"GGUF q4_k_m (Pi deploy): {OUTPUT_DIR}/gguf_q4_k_m")
-    print(f"GGUF f16 (quality ref):  {OUTPUT_DIR}/gguf_f16")
+    print(f"GGUF q4_k_m: {OUTPUT_DIR}/gguf_q4_k_m")
 
 
 if __name__ == "__main__":
