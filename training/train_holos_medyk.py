@@ -25,13 +25,13 @@ MODEL_NAME = "google/gemma-4-E4b-it"
 TRAIN_FILE = "data/training/train_holos_medyk_v3_curated.jsonl"
 OUTPUT_DIR = "training/outputs/holos_medyk_gemma4_e4b"
 MAX_SEQ_LENGTH = 2048
-LORA_RANK = 32
-LORA_ALPHA = 64
-LEARNING_RATE = 2e-4
-NUM_EPOCHS = 3
+LORA_RANK = 8
+LORA_ALPHA = 16
+LEARNING_RATE = 5e-6
+NUM_EPOCHS = 2
 BATCH_SIZE = 2
 GRAD_ACCUM = 4  # effective batch = 8
-WARMUP_RATIO = 0.05
+WARMUP_RATIO = 0.1
 SEED = 42
 
 
