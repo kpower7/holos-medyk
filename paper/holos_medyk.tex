@@ -388,9 +388,17 @@ This section is the living log of the project. Each day we add a dated entry des
 \item Language split: 56\% Ukrainian, 44\% English. Average response length: 126 words. Final dataset: \texttt{data/training/train\_holos\_medyk\_v3\_curated.jsonl}.
 \end{itemize}
 
+\textit{v3 training and benchmark --- catastrophic overfitting.}
+\begin{itemize}
+\item Trained on the 266 curated examples using \textbf{the same hyperparameters as v1/v2} (learning rate 2e-4, LoRA rank 32, alpha 64, 3 epochs). This was a critical error: hyperparameters designed for 3{,}511 examples were applied unchanged to a 13$\times$ smaller dataset.
+\item Result: \textbf{complete model collapse}. Every fine-tuned response hit the 512-token ceiling at exactly $\sim$39 seconds. Responses contained incoherent repetition (``cloth, cloth, more more,'' ``tilt his head back, tilt his head back, tilt the head back''), gender pronoun confusion (switching ``him'' and ``her'' mid-sentence), hallucinated dangerous medical advice (shock scenario: ``give them warm liquids like water''; chest wound: ``make a hole in her chest''), and random AI-disclaimer insertions.
+\item \textbf{Root cause}: with a learning rate of 2e-4 and LoRA rank 32 on only 266 examples across 3 epochs (99 total steps), each gradient update made enormous weight changes. The model memorized the training examples' content patterns but lost its ability to generate a clean end-of-sequence token, produce grammatically coherent text, or maintain consistent pronoun reference. This is textbook catastrophic overfitting.
+\item \textbf{Hyperparameter fix applied}: learning rate reduced 40$\times$ to 5e-6, LoRA rank reduced 4$\times$ to 8 (alpha 16), epochs reduced to 2. These settings are appropriate for gently nudging a strong base model's behavior with a small curated dataset, rather than overwriting its behavior distribution. The v4 training run with corrected hyperparameters is pending.
+\end{itemize}
+
 \textbf{What comes next (Day 5).}
 \begin{itemize}
-\item Run Stage~3 SFT on the v3 curated dataset (266 examples) on RunPod and benchmark against baseline.
+\item Run v4 SFT with corrected hyperparameters (LR 5e-6, rank 8, 2 epochs) on the 266-example curated dataset and benchmark against baseline. This is the critical test of whether small-dataset behavioral nudging works.
 \item Get brother's first batch of golden examples for GRPO/DPO refinement.
 \item Integrate Robinhad Tetiana TTS on Jetson, Silero \texttt{ukr\_roman} on Pi/Android/iOS.
 \item When the Jetson arrives, bring up \texttt{llama.cpp} with CUDA and benchmark Gemma~4 E2B/E4B inference.
