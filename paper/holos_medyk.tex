@@ -244,6 +244,61 @@ The evaluation script will be written in the same style as the Gemini 2.5 Pro te
 
 This section is the living log of the project. Each day we add a dated entry describing what was done, what was learned, and what comes next. The most recent entry sits at the top; older entries accumulate below. At the end of the project this changelog will be flattened into a chronological narrative for the final write-up.
 
+\subsection*{Day 5 --- 2026-04-07 (Monday): Curated dataset, training failures, and LoRA layer targeting discovery}
+
+\textbf{Summary.} Focused on three tasks: (1) building a 266-example curated training dataset via Claude Code subagents, (2) running two more failed SFT attempts (v3 and v4) that revealed a fundamental LoRA layer targeting error present in all previous training runs, and (3) fixing the training pipeline to use Unsloth's \texttt{FastModel} with \texttt{finetune\_vision\_layers=False}. The key discovery: all previous fine-tunes applied LoRA to the vision and audio encoder layers of the multimodal Gemma~4 architecture, not just the text decoder --- explaining the Unicode garbage, multilingual hallucinations, and generation collapse in v3/v4.
+
+\textbf{What was done.}
+
+\textit{Curated training dataset (v3, 266 examples).}
+\begin{itemize}
+\item Generated 266 high-quality training examples using Claude Code subagents in batches of 10, organized into five categories: refusal override (60), MARCH-ordered polytrauma (80), corrective (40), Ukrainian colloquial (57), and clean stop behavior (29). Language split: 56\% Ukrainian, 44\% English.
+\item Three rounds of quality auditing by separate subagents identified and fixed: a reversed snake-bite bandage direction, three remaining three-sided chest seal references, a 30-second double-tap wait time (corrected to 5 minutes), an incorrect 2-hour tourniquet limit (corrected to 6+ hours), three MARCH-order violations, a head-tilt on blast victim (changed to jaw thrust), a missing Rh factor warning, four duplicate scenarios, and two examples with outdated ``no painkillers for appendicitis'' advice.
+\end{itemize}
+
+\textit{v3 training --- catastrophic overfitting.}
+\begin{itemize}
+\item Trained on the 266 curated examples using the same hyperparameters as v1/v2 (LR 2e-4, rank 32, alpha 64, 3 epochs). 99 total steps. Final loss: 5.29.
+\item Result: complete model collapse. Every response hit the 512-token ceiling at $\sim$39 seconds. Outputs contained incoherent repetition, gender confusion, hallucinated dangerous medical advice, and random AI-disclaimer insertions. Identical failure pattern to v2 but worse.
+\item Root cause attributed to hyperparameters being too aggressive for a 266-example dataset.
+\end{itemize}
+
+\textit{v4 training --- hyperparameter reduction, still broken.}
+\begin{itemize}
+\item Reduced hyperparameters: LR 5e-6 (40$\times$ lower), rank 8, alpha 16, 2 epochs.
+\item Result: even worse. Outputs contained random Unicode characters, LaTeX tokens, mixed-script hallucinations (Chinese, Japanese, Indonesian text fragments), and complete semantic incoherence. This was qualitatively different from v3's overfitting --- it looked like model corruption rather than memorization.
+\end{itemize}
+
+\textit{Root cause discovery: LoRA applied to wrong layers.}
+\begin{itemize}
+\item Investigation of working Unsloth examples (official notebooks, Google's QLoRA guide, community repos) revealed the critical error: \textbf{all previous training runs used \texttt{FastLanguageModel} with explicit \texttt{target\_modules=["q\_proj", "k\_proj", ..."]}, which applies LoRA to every matching layer in the entire multimodal model} --- including the vision encoder, audio encoder, and multi-modal projector. Gemma~4 E4B is a \texttt{Gemma4ForConditionalGeneration} (multimodal) model, not a text-only model.
+\item The correct approach uses \texttt{FastModel} (not \texttt{FastLanguageModel}) with \texttt{finetune\_vision\_layers=False} and \texttt{finetune\_language\_layers=True}. This restricts LoRA to the text decoder only, leaving vision/audio encoder weights frozen.
+\item This explains why v1 (3{,}511 examples) appeared to work tolerably: with enough training data the text decoder signal overwhelmed the vision/audio corruption. With only 266 examples (v3/v4), the corruption dominated. The v4 Unicode garbage was literally the vision encoder's learned representations bleeding into text generation.
+\item Training script rewritten to use \texttt{FastModel}, \texttt{unsloth/gemma-4-E4B-it} (optimized weights), \texttt{load\_in\_4bit=True}, \texttt{max\_steps=60} (instead of epochs), and Unsloth's official hyperparameters (LR 2e-4, rank 8, alpha 8, linear scheduler).
+\end{itemize}
+
+\textit{v5 training and evaluation (in progress).}
+\begin{itemize}
+\item v5 training completed with corrected \texttt{FastModel} pipeline. 60 steps, final loss 2.70. LoRA adapter uploaded to HuggingFace as \texttt{kevpower/holos-medyk-lora-v5}. Merged model export hung during the merge step ($>$1 hour at 0\%); killed and deferred.
+\item Wrote a separate Unsloth-based evaluation script (\texttt{evaluation/run\_eval\_unsloth.py}) that loads the LoRA adapter directly via \texttt{FastModel.from\_pretrained} on the adapter repo, avoiding the need for a merged model. Encountered tokenizer compatibility issue: Unsloth's tokenizer wrapper returns \texttt{str} from \texttt{apply\_chat\_template} even with \texttt{return\_tensors="pt"}, requiring a two-step tokenization (template $\rightarrow$ string $\rightarrow$ tokenize). Fix applied on RunPod. Benchmark results pending.
+\end{itemize}
+
+\textbf{What was learned.}
+\begin{itemize}
+\item \textbf{LoRA layer targeting on multimodal models is the single most important training decision.} Applying LoRA to all \texttt{q\_proj}/\texttt{k\_proj} layers in a multimodal model corrupts non-text encoders. The symptom (Unicode garbage, mixed scripts) is indistinguishable from hyperparameter problems unless you know to look for it. Unsloth's \texttt{FastModel} with \texttt{finetune\_vision\_layers=False} handles this correctly.
+\item \textbf{Hyperparameters must be updated when dataset size changes.} Going from 3{,}511 to 266 examples without adjusting LR, rank, and epochs caused catastrophic overfitting. This was an obvious oversight that cost two failed training runs.
+\item \textbf{``It worked with more data'' masks architectural errors.} v1's tolerable results on 3{,}511 examples hid the fact that LoRA was corrupting vision/audio layers. The corruption was diluted by volume. Smaller datasets exposed the bug.
+\item \textbf{Always check official examples before writing training code.} The Unsloth official Gemma~4 notebook uses \texttt{FastModel} with explicit vision/language layer controls. The project used \texttt{FastLanguageModel} with manual target modules because it was written before checking the official examples. Hours of debugging could have been avoided.
+\end{itemize}
+
+\textbf{What comes next (Day 6).}
+\begin{itemize}
+\item Complete v5 benchmark and evaluate whether text-only LoRA with 266 curated examples produces a meaningful improvement over baseline.
+\item If v5 works: iterate on dataset and hyperparameters. If not: evaluate DPO as an alternative to SFT.
+\item Integrate Robinhad Tetiana TTS on Jetson, Silero \texttt{ukr\_roman} on Pi/Android/iOS.
+\item When the Jetson arrives, bring up \texttt{llama.cpp} with CUDA and benchmark Gemma~4 E2B/E4B inference.
+\end{itemize}
+
 \subsection*{Day 4 --- 2026-04-06 (Sunday): Clinical research, TTS crisis, hardware pivot, and product scope expansion}
 
 \textbf{Summary.} The longest and most technically dense day of the project, spanning twelve workstreams across roughly 18 hours. The day began with training data strategy and clinical research, pivoted through two full SFT training runs and their benchmarks, and ended with a fundamental strategy change: \textbf{large-scale synthetic SFT degrades the base model.} Gemma~4 E4B is already strong on emergency medicine; the correct approach is a small, curated dataset ($\sim$200--500 examples) targeting the specific behaviors that differ from baseline (MARCH ordering, never-refuse, crush syndrome, chest seal technique). Key milestones: (1) deep clinical research from trauma surgeon input, restructuring around MARCH; (2) Piper TTS attribution fix and 80-file TTS engine comparison; (3) Jetson Orin Nano Super ordered; (4) product scope expanded to general emergency; (5) Stage~1 SFT completed (loss 0.72) --- fine-tuned model fixes critical baseline errors but introduces generation loops; (6) v2 dataset created (tags stripped, 172 refusals regenerated via DeepSeek R1); (7) Stage~2 SFT completed (loss 1.03) --- \textbf{model is worse than baseline}, with ``I am sorry'' loops and persistent refusals, confirming that synthetic SFT at scale is counterproductive; (8) strategy pivoted to small curated dataset + DPO/GRPO; (9) Diana selected robinhad Tetiana as production Ukrainian voice; (10) TTS deployment decided: Tetiana on Jetson (PyTorch/CUDA), Silero v5 ukr\_roman on Pi/Android/iOS (ONNX).
