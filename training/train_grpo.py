@@ -202,8 +202,8 @@ def to_grpo_format(example):
     assistant_msg = next(m["content"] for m in messages if m["role"] == "assistant")
     return {
         "prompt": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
+            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+            {"role": "user", "content": [{"type": "text", "text": user_msg}]},
         ],
         "reference": assistant_msg,
         "user_text": user_msg,
@@ -245,7 +245,7 @@ def reward_correctness(prompts, completions, **kwargs):
     jobs = []
     for prompt_msgs, completion in zip(prompts, completions):
         response = completion[0]["content"]
-        user_text = next(m["content"] for m in prompt_msgs if m["role"] == "user")
+        user_text = next(m["content"][0]["text"] for m in prompt_msgs if m["role"] == "user")
         user_key = user_text.strip().lower()
 
         # Build criteria text for the judge
@@ -288,7 +288,7 @@ def reward_similarity(prompts, completions, **kwargs):
 
     for prompt_msgs, completion in zip(prompts, completions):
         response = completion[0]["content"]
-        user_text = next(m["content"] for m in prompt_msgs if m["role"] == "user")
+        user_text = next(m["content"][0]["text"] for m in prompt_msgs if m["role"] == "user")
         user_key = user_text.strip().lower()
         idx = teacher_embed_idx.get(user_key, -1)
         responses_to_embed.append(response)
