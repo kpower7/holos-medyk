@@ -16,12 +16,12 @@ Usage (RunPod A100):
 """
 
 import os, re, json, torch, time, threading
+import torch.nn as nn
 import numpy as np
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
+from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -44,7 +44,35 @@ if env_path.exists():
                 k, v = line.split("=", 1)
                 os.environ[k.strip()] = v.strip().strip("'\"")
 
-# ── Load model + LoRA ───────────────────────────────────────────────────────
+# ── Monkey-patch Gemma4ClippableLinear ──────────────────────────────────────
+# Gemma 4 uses ClippableLinear in vision/audio encoders which inherits from
+# nn.Module instead of nn.Linear, causing peft to reject it. Even though we
+# exclude those modules, the patch prevents errors during model inspection.
+from transformers.models.gemma4 import modeling_gemma4
+
+class PatchedClippableLinear(nn.Linear):
+    def __init__(self, config, in_features, out_features):
+        nn.Linear.__init__(self, in_features, out_features, bias=False)
+        self.use_clipped_linears = getattr(config, "use_clipped_linears", False)
+        if self.use_clipped_linears:
+            self.register_buffer("input_min", torch.tensor(-float("inf")))
+            self.register_buffer("input_max", torch.tensor(float("inf")))
+            self.register_buffer("output_min", torch.tensor(-float("inf")))
+            self.register_buffer("output_max", torch.tensor(float("inf")))
+
+    def forward(self, x):
+        if self.use_clipped_linears:
+            x = torch.clamp(x, self.input_min, self.input_max)
+        out = nn.Linear.forward(self, x)
+        if self.use_clipped_linears:
+            out = torch.clamp(out, self.output_min, self.output_max)
+        return out
+
+modeling_gemma4.Gemma4ClippableLinear = PatchedClippableLinear
+
+# ── Load model ──────────────────────────────────────────────────────────────
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 print(f"Loading {MODEL_NAME}...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
@@ -56,9 +84,30 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# Apply LoRA to text decoder layers only
-# Gemma 4 E4B text decoder layers match: model.language_model.model.layers.*
-print("Applying LoRA to text decoder...")
+# ── BOS token workaround ───────────────────────────────────────────────────
+# TRL GRPOTrainer calls tokenizer with add_special_tokens=False, which strips
+# the BOS token that Gemma requires. This wrapper forces it back on.
+# See: https://github.com/huggingface/trl/issues/3520
+_original_tokenizer_call = tokenizer.__class__.__call__
+
+class GemmaBOSTokenizerWrapper:
+    """Wraps tokenizer to always add special tokens (BOS) for Gemma."""
+    def __init__(self, tokenizer):
+        self._tokenizer = tokenizer
+
+    def __call__(self, *args, add_special_tokens=True, **kwargs):
+        # Always force add_special_tokens=True for Gemma
+        return self._tokenizer(*args, add_special_tokens=True, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._tokenizer, name)
+
+wrapped_tokenizer = GemmaBOSTokenizerWrapper(tokenizer)
+
+# ── LoRA config (text decoder only) ────────────────────────────────────────
+# exclude_modules prevents LoRA from touching vision_tower, audio_tower, and
+# multi_modal_projector — the bug that caused v3/v4 model corruption.
+print("LoRA config: text decoder only (vision/audio excluded)...")
 lora_config = LoraConfig(
     r=LORA_RANK,
     lora_alpha=LORA_ALPHA,
@@ -69,11 +118,8 @@ lora_config = LoraConfig(
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
     ],
-    # Only target the language model, not vision/audio encoders
-    modules_to_save=None,
+    exclude_modules=["vision_tower", "multi_modal_projector", "audio_tower"],
 )
-model = get_peft_model(model, lora_config)
-model.print_trainable_parameters()
 
 # ── Load teacher responses for similarity reward ────────────────────────────
 print("Loading teacher responses...")
@@ -113,7 +159,12 @@ teacher_embed_idx = {k: i for i, k in enumerate(all_teacher_keys)}
 # ── Initialize Gemini judge ─────────────────────────────────────────────────
 print(f"Initializing judge: {JUDGE_MODEL}...")
 from google import genai
-judge_client = genai.Client()
+from google.genai.types import HttpOptions, HttpRetryOptions
+judge_client = genai.Client(
+    http_options=HttpOptions(
+        retry_options=HttpRetryOptions(attempts=5, initial_delay=1.0, max_delay=30.0)
+    )
+)
 
 JUDGE_SYSTEM = (
     "You are a medical accuracy judge. You will be given:\n"
@@ -378,7 +429,7 @@ training_args = GRPOConfig(
 print("\nInitializing GRPO trainer...")
 trainer = GRPOTrainer(
     model=model,
-    processing_class=tokenizer,
+    processing_class=wrapped_tokenizer,
     reward_funcs=[
         reward_no_refusal,
         reward_correctness,
@@ -387,6 +438,7 @@ trainer = GRPOTrainer(
     ],
     args=training_args,
     train_dataset=dataset,
+    peft_config=lora_config,
 )
 
 print(f"\nStarting GRPO training (1 epoch, {len(dataset)} examples, 4 generations each)...")
@@ -396,7 +448,7 @@ result = trainer.train()
 
 # ── Save ────────────────────────────────────────────────────────────────────
 print("\nSaving LoRA adapter...")
-model.save_pretrained(f"{OUTPUT_DIR}/lora_adapter")
+trainer.model.save_pretrained(f"{OUTPUT_DIR}/lora_adapter")
 tokenizer.save_pretrained(f"{OUTPUT_DIR}/lora_adapter")
 
 metrics = {
