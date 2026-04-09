@@ -1,6 +1,8 @@
 """
 Holos Medyk — GRPO Training for Gemma 4 E4B.
 
+No Unsloth. Plain transformers + peft + trl on A100 80GB.
+
 Reward functions:
   1. No-refusal  — binary 0/1: did you help or refuse?
   2. Correctness — LLM-as-judge via Gemini 2.5 Flash (20 parallel workers)
@@ -8,8 +10,8 @@ Reward functions:
   4. Format      — length, no repetition, no filler
 
 Usage (RunPod A100):
-    pip install unsloth sentence-transformers google-genai
-    export GOOGLE_API_KEY=<your-key>   # or set in .env
+    pip install trl transformers peft accelerate sentence-transformers google-genai
+    export GOOGLE_API_KEY=<your-key>
     python training/train_grpo.py
 """
 
@@ -17,16 +19,15 @@ import os, re, json, torch, time, threading
 import numpy as np
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from unsloth import FastModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
 from trl import GRPOConfig, GRPOTrainer
 
 # ── Config ──────────────────────────────────────────────────────────────────
-MODEL_NAME = "unsloth/gemma-4-E4B-it"
+MODEL_NAME = "google/gemma-4-E4B-it"
 OUTPUT_DIR = "training/outputs/holos_medyk_grpo_v1"
-MAX_SEQ_LENGTH = 2048
-MAX_PROMPT_LENGTH = 512
-MAX_COMPLETION_LENGTH = MAX_SEQ_LENGTH - MAX_PROMPT_LENGTH
+MAX_COMPLETION_LENGTH = 1536
 LORA_RANK = 8
 LORA_ALPHA = 8
 SEED = 3407
@@ -43,29 +44,36 @@ if env_path.exists():
                 k, v = line.split("=", 1)
                 os.environ[k.strip()] = v.strip().strip("'\"")
 
-# ── Load model ──────────────────────────────────────────────────────────────
+# ── Load model + LoRA ───────────────────────────────────────────────────────
 print(f"Loading {MODEL_NAME}...")
-model, tokenizer = FastModel.from_pretrained(
-    model_name=MODEL_NAME,
-    max_seq_length=MAX_SEQ_LENGTH,
-    load_in_4bit=False,   # GRPO needs full precision for generation quality
-    load_in_8bit=False,
-    full_finetuning=False,
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    attn_implementation="eager",
 )
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
-print("Applying LoRA (text layers only)...")
-model = FastModel.get_peft_model(
-    model,
-    finetune_vision_layers=False,
-    finetune_language_layers=True,
-    finetune_attention_modules=True,
-    finetune_mlp_modules=True,
+# Apply LoRA to text decoder layers only
+# Gemma 4 E4B text decoder layers match: model.language_model.model.layers.*
+print("Applying LoRA to text decoder...")
+lora_config = LoraConfig(
     r=LORA_RANK,
     lora_alpha=LORA_ALPHA,
     lora_dropout=0,
     bias="none",
-    random_state=SEED,
+    task_type="CAUSAL_LM",
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ],
+    # Only target the language model, not vision/audio encoders
+    modules_to_save=None,
 )
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
 
 # ── Load teacher responses for similarity reward ────────────────────────────
 print("Loading teacher responses...")
@@ -80,7 +88,6 @@ for fname in os.listdir(response_dir):
             teacher_responses[obj["prompt"].strip().lower()] = obj["response"]
 print(f"  Loaded {len(teacher_responses)} teacher responses")
 
-# Also load curated training data as teacher references (these are the good ones)
 curated_teachers = {}
 with open("data/training/train_holos_medyk_v3_curated.jsonl", "r", encoding="utf-8") as f:
     for line in f:
@@ -97,7 +104,6 @@ from sentence_transformers import SentenceTransformer
 embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 embed_model.eval()
 
-# Pre-compute teacher embeddings (prefer curated, fall back to raw teacher)
 print("Pre-computing teacher embeddings...")
 all_teacher_keys = list(set(list(curated_teachers.keys()) + list(teacher_responses.keys())))
 all_teacher_texts = [curated_teachers.get(k, teacher_responses.get(k, "")) for k in all_teacher_keys]
@@ -120,7 +126,6 @@ JUDGE_SYSTEM = (
     "Reply with ONLY a JSON object: {\"score\": 0.X, \"reason\": \"brief explanation\"}"
 )
 
-# Thread-safe cache for judge scores within a training step
 judge_cache = {}
 judge_lock = threading.Lock()
 
@@ -151,7 +156,6 @@ def judge_one(prompt_text, response_text, criteria_text):
                 ),
             )
             text = response.text.strip()
-            # Parse JSON from response
             json_match = re.search(r'\{[^}]+\}', text)
             if json_match:
                 result = json.loads(json_match.group())
@@ -165,21 +169,16 @@ def judge_one(prompt_text, response_text, criteria_text):
                 time.sleep(2 ** attempt)
             else:
                 time.sleep(1)
-    return 0.0  # Default on failure
+    return 0.0
 
 
-# ── Build criteria lookup from eval scenarios + curated data ────────────────
-# For eval scenarios we have explicit criteria
+# ── Build criteria lookup ───────────────────────────────────────────────────
 eval_criteria = {}
 with open("evaluation/eval_scenarios.jsonl", "r", encoding="utf-8") as f:
     for line in f:
         s = json.loads(line)
         eval_criteria[s["prompt"].strip().lower()] = s["key_criteria"]
-
-# For curated training data, use the teacher response as the criteria
-# (the judge will compare against the teacher's clinical content)
 print(f"  {len(eval_criteria)} scenarios with explicit criteria")
-print(f"  Remaining examples will use teacher response as reference for judging")
 
 
 # ── Prepare dataset ─────────────────────────────────────────────────────────
@@ -203,8 +202,8 @@ def to_grpo_format(example):
     assistant_msg = next(m["content"] for m in messages if m["role"] == "assistant")
     return {
         "prompt": [
-            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-            {"role": "user", "content": [{"type": "text", "text": user_msg}]},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
         ],
         "reference": assistant_msg,
         "user_text": user_msg,
@@ -213,6 +212,18 @@ def to_grpo_format(example):
 
 dataset = raw.map(to_grpo_format, remove_columns=raw.column_names)
 print(f"  {len(dataset)} training examples")
+
+
+# ── Helper: extract user text from prompt messages ──────────────────────────
+def get_user_text(prompt_msgs):
+    """Extract user text from prompt, handling both str and list content formats."""
+    for m in prompt_msgs:
+        if m["role"] == "user":
+            content = m["content"]
+            if isinstance(content, list):
+                return content[0]["text"]
+            return content
+    return ""
 
 
 # ── Reward 1: No-refusal (binary) ──────────────────────────────────────────
@@ -233,7 +244,7 @@ def reward_no_refusal(completions, **kwargs):
         if REFUSAL_PATTERNS.search(response):
             scores.append(0.0)
         elif len(response.strip()) < 30:
-            scores.append(0.0)  # Empty/near-empty response = implicit refusal
+            scores.append(0.0)
         else:
             scores.append(1.0)
     return scores
@@ -242,18 +253,15 @@ def reward_no_refusal(completions, **kwargs):
 # ── Reward 2: Correctness via LLM judge ────────────────────────────────────
 def reward_correctness(prompts, completions, **kwargs):
     """LLM-as-judge scoring via Gemini Flash, 20 parallel workers."""
-    # Collect all jobs
     jobs = []
     for prompt_msgs, completion in zip(prompts, completions):
         response = completion[0]["content"]
-        user_text = next(m["content"][0]["text"] for m in prompt_msgs if m["role"] == "user")
+        user_text = get_user_text(prompt_msgs)
         user_key = user_text.strip().lower()
 
-        # Build criteria text for the judge
         if user_key in eval_criteria:
             criteria = "\n".join(f"- {c}" for c in eval_criteria[user_key])
         elif user_key in curated_teachers:
-            # Use teacher response as reference
             criteria = (
                 "The response should cover the same clinical points as this reference:\n"
                 f"{curated_teachers[user_key]}"
@@ -263,7 +271,6 @@ def reward_correctness(prompts, completions, **kwargs):
 
         jobs.append((user_text, response, criteria))
 
-    # Run judge calls in parallel
     scores = [0.0] * len(jobs)
     with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as pool:
         future_to_idx = {
@@ -289,7 +296,7 @@ def reward_similarity(prompts, completions, **kwargs):
 
     for prompt_msgs, completion in zip(prompts, completions):
         response = completion[0]["content"]
-        user_text = next(m["content"][0]["text"] for m in prompt_msgs if m["role"] == "user")
+        user_text = get_user_text(prompt_msgs)
         user_key = user_text.strip().lower()
         idx = teacher_embed_idx.get(user_key, -1)
         responses_to_embed.append(response)
@@ -303,7 +310,6 @@ def reward_similarity(prompts, completions, **kwargs):
             else:
                 t_emb = teacher_embeddings[t_idx]
                 sim = float(np.dot(resp_emb, t_emb) / (np.linalg.norm(resp_emb) * np.linalg.norm(t_emb) + 1e-8))
-                # Linear map: 0.3 → 0.0, 0.8 → 1.0
                 reward = max(0.0, min(1.0, (sim - 0.3) / 0.5))
                 scores.append(round(reward, 3))
     return scores
@@ -328,18 +334,15 @@ def reward_format(completions, **kwargs):
         checks_passed = 0
         total_checks = 3
 
-        # Length: sweet spot is 200-1200 chars
         rlen = len(response)
         if 200 <= rlen <= 1200:
             checks_passed += 1
         elif 100 <= rlen < 200 or 1200 < rlen <= 1500:
             checks_passed += 0.5
 
-        # No repetition loops
         if not REPETITION_PATTERN.search(response):
             checks_passed += 1
 
-        # No filler
         if not FILLER_PATTERNS.search(response):
             checks_passed += 1
 
@@ -355,12 +358,13 @@ training_args = GRPOConfig(
     adam_beta1=0.9,
     adam_beta2=0.99,
     weight_decay=0.1,
-    warmup_ratio=0.1,
+    warmup_steps=5,
     lr_scheduler_type="cosine",
     optim="adamw_torch_fused",
     logging_steps=1,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=1,  # Match Unsloth GRPO notebook
+    bf16=True,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=1,
     num_generations=4,
     max_completion_length=MAX_COMPLETION_LENGTH,
     num_train_epochs=1,
@@ -369,7 +373,6 @@ training_args = GRPOConfig(
     seed=SEED,
     output_dir=OUTPUT_DIR,
     report_to="none",
-    use_vllm=False,               # Required for Unsloth GRPO
 )
 
 print("\nInitializing GRPO trainer...")
@@ -405,6 +408,7 @@ metrics = {
     "num_train_epochs": training_args.num_train_epochs,
     "judge_model": JUDGE_MODEL,
     "method": "GRPO",
+    "framework": "transformers + peft + trl (no Unsloth)",
 }
 with open(f"{OUTPUT_DIR}/training_metrics.json", "w") as f:
     json.dump(metrics, f, indent=2)

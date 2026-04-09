@@ -38,7 +38,7 @@ cd holos-medyk
 ```
 
 ```
-pip install unsloth sentence-transformers google-genai
+pip install trl transformers peft accelerate sentence-transformers google-genai
 ```
 
 ```
