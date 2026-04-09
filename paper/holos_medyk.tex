@@ -296,11 +296,30 @@ This section is the living log of the project. Each day we add a dated entry des
 \item \textbf{A strong base model needs reinforcement, not replacement.} GRPO's advantage: it compares 4 generations per prompt and reinforces the better ones. The model learns to do more of what it already does well, rather than memorizing 266 specific responses.
 \end{itemize}
 
+\textit{GRPO deployment --- blocked by Unsloth/TRL dependency conflicts.}
+\begin{itemize}
+\item Attempted to run GRPO training on RunPod A100. Encountered a cascade of dependency and compatibility issues over $\sim$1 hour of debugging:
+  \begin{enumerate}
+  \item \texttt{ModuleNotFoundError: No module named 'mergekit'} --- TRL's \texttt{GRPOTrainer} now imports \texttt{mergekit} at module level.
+  \item \texttt{ImportError: cannot import name 'TRANSFORMERS\_CACHE'} --- stale \texttt{transformers} version in the RunPod PyTorch template conflicting with newer TRL.
+  \item \texttt{TypeError: GRPOConfig.\_\_init\_\_() got an unexpected keyword argument 'max\_prompt\_length'} --- Unsloth patches \texttt{GRPOConfig} and removes/renames parameters. Resolved by inspecting the actual signature via \texttt{inspect.signature()}.
+  \item \texttt{TypeError: string indices must be integers, not 'str'} --- Unsloth's GRPO tokenizer expects multimodal message format (\texttt{[\{"type": "text", "text": "..."\}]}) because Gemma~4 is a multimodal model. Resolved by reformatting prompt content.
+  \item \texttt{TypeError: FastBaseModel.post\_patch\_model.<locals>.\_gc\_enable\_reentrant() takes 0 positional arguments but 1 was given} --- fundamental incompatibility between Unsloth's gradient checkpointing monkey-patch and TRL's \texttt{disable\_gradient\_checkpointing} context manager. Not resolvable by changing our code.
+  \item \texttt{ModuleNotFoundError: No module named 'vllm'} --- downgrading TRL introduced a hard vLLM dependency in the GRPO trainer import path.
+  \end{enumerate}
+\item Root cause: Unsloth heavily patches TRL's \texttt{GRPOTrainer} and \texttt{GRPOConfig} and is version-locked to specific TRL/transformers combinations. The RunPod PyTorch 2.x template ships mismatched versions. No Gemma~4 GRPO notebook exists from Unsloth (only Gemma~3), so there is no known-working configuration to copy.
+\item \textbf{Status: GRPO blocked pending environment resolution.} Two paths forward: (1) reinstall Unsloth from scratch on RunPod and verify the import chain works before running training, or (2) move to Google Colab where Unsloth's GRPO notebooks are tested. The GRPO training script itself (\texttt{training/train\_grpo.py}) is complete and ready --- the blocking issue is purely environmental.
+\end{itemize}
+
+\textit{v5 SFT evaluation --- also blocked.}
+\begin{itemize}
+\item Attempted to run \texttt{evaluation/run\_eval\_unsloth.py} on RunPod. Hit \texttt{AttributeError: 'str' object has no attribute 'to'} --- Unsloth's tokenizer wrapper returns a string from \texttt{apply\_chat\_template} even with \texttt{return\_tensors="pt"}. Fixed by switching to the multimodal pattern (\texttt{tokenize=True, return\_dict=True}), but the same error persisted after \texttt{git pull}, suggesting a caching issue on RunPod. Deferred in favor of GRPO work.
+\end{itemize}
+
 \textbf{What comes next (Day 7).}
 \begin{itemize}
-\item Run v5 SFT evaluation on RunPod to establish a complete SFT baseline.
-\item Run first GRPO training pass and evaluate against baseline.
-\item If GRPO improves clinical accuracy without degrading generation quality, iterate on reward weights and consider a second pass.
+\item Resolve GRPO environment: \texttt{pip install --force-reinstall unsloth} on RunPod and verify \texttt{from trl import GRPOTrainer} succeeds before attempting training. If RunPod environment is unfixable, move to Colab with L4 GPU.
+\item If GRPO remains blocked, fall back to SFT v6 with the improved system prompt and evaluate whether prompt engineering alone closes the clinical gaps.
 \item Begin RAG/retrieval integration for shelter locations and city-specific protocols.
 \end{itemize}
 
