@@ -34,12 +34,18 @@ def bench(model, tok, tag):
     out = []
     for i, s in enumerate(SCENARIOS):
         print(f"\n[{i+1}/{len(SCENARIOS)}] {s['id']} ({s['lang']})", flush=True)
-        ids = tok.apply_chat_template([{"role": "user", "content": SYSTEM + "\n\n" + s["prompt"]}], return_tensors="pt", add_generation_prompt=True, return_dict=False).to(model.device)
+        inputs = tok.apply_chat_template(
+            [{"role": "user", "content": SYSTEM + "\n\n" + s["prompt"]}],
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        ).to(model.device)
         t0 = time.time()
         with torch.no_grad():
-            gen = model.generate(input_ids=ids, max_new_tokens=512, temperature=0.3, do_sample=True, top_p=0.9)
+            gen = model.generate(**inputs, max_new_tokens=512, temperature=1.0, top_p=0.95, top_k=64)
         dt = time.time() - t0
-        resp = tok.decode(gen[0][ids.shape[1]:], skip_special_tokens=True)
+        resp = tok.decode(gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
         out.append({"id": s["id"], "lang": s["lang"], "prompt": s["prompt"], "key_criteria": s["key_criteria"], "response": resp, "seconds": round(dt, 1), "tag": tag})
         print(f"  ({dt:.1f}s) {resp[:200]}...", flush=True)
     return out
