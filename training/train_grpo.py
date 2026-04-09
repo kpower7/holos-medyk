@@ -48,7 +48,8 @@ print(f"Loading {MODEL_NAME}...")
 model, tokenizer = FastModel.from_pretrained(
     model_name=MODEL_NAME,
     max_seq_length=MAX_SEQ_LENGTH,
-    load_in_4bit=True,
+    load_in_4bit=False,   # GRPO needs full precision for generation quality
+    load_in_8bit=False,
     full_finetuning=False,
 )
 
@@ -356,18 +357,19 @@ training_args = GRPOConfig(
     weight_decay=0.1,
     warmup_ratio=0.1,
     lr_scheduler_type="cosine",
-    optim="adamw_8bit",
+    optim="adamw_torch_fused",
     logging_steps=1,
     per_device_train_batch_size=1,
-    gradient_accumulation_steps=4,
+    gradient_accumulation_steps=1,  # Match Unsloth GRPO notebook
     num_generations=4,
     max_completion_length=MAX_COMPLETION_LENGTH,
-    num_train_epochs=1,           # Single pass through 266 examples
-    save_steps=9999,              # Save only at end
+    num_train_epochs=1,
+    save_steps=9999,
     max_grad_norm=0.1,
     seed=SEED,
     output_dir=OUTPUT_DIR,
     report_to="none",
+    use_vllm=False,               # Required for Unsloth GRPO
 )
 
 print("\nInitializing GRPO trainer...")
