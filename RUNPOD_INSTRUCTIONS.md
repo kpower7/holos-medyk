@@ -1,4 +1,4 @@
-# RunPod Training & Eval — Step by Step
+# RunPod — Step by Step
 
 Every time you need to train or benchmark on RunPod, follow these steps exactly.
 
@@ -38,7 +38,7 @@ cd holos-medyk
 ```
 
 ```
-pip install unsloth wandb
+pip install unsloth sentence-transformers google-genai
 ```
 
 ```
@@ -53,85 +53,140 @@ export HF_TOKEN=<your-hf-write-token>
 export WANDB_MODE=disabled
 ```
 
----
-
-## 4. Train
-
 ```
-nohup python training/train_holos_medyk.py > /workspace/train_log.txt 2>&1 &
-```
-
-Check progress (can disconnect and reconnect anytime):
-```
-tail -f /workspace/train_log.txt
-```
-
-**IMPORTANT**: Always use `nohup`. Your laptop can sleep — the training continues on the server.
-
-Training takes ~35-45 minutes on A100. When you see the training metrics summary and "Saving LoRA adapter..." it's done.
-
-**GGUF export will hang** asking for interactive input. If it hangs, open a second terminal tab and kill it:
-```
-kill -9 $(pgrep -f train_holos)
-```
-The LoRA adapter and merged model are already saved at this point.
-
----
-
-## 5. Upload Models to HuggingFace
-
-Replace `v2` with the version you're training (v3, v4, etc.):
-
-**LoRA adapter (~357MB, fast):**
-```
-python -c "from huggingface_hub import HfApi; api = HfApi(); api.create_repo('kevpower/holos-medyk-lora-v2', exist_ok=True); api.upload_folder(folder_path='training/outputs/holos_medyk_gemma4_e4b/lora_adapter', repo_id='kevpower/holos-medyk-lora-v2'); print('LoRA done')"
-```
-
-**Merged model (~15GB, takes a few minutes):**
-```
-python -c "from huggingface_hub import HfApi; api = HfApi(); api.create_repo('kevpower/holos-medyk-merged-v2', exist_ok=True); api.upload_folder(folder_path='training/outputs/holos_medyk_gemma4_e4b/merged_16bit', repo_id='kevpower/holos-medyk-merged-v2'); print('Merged done')"
+export GOOGLE_API_KEY=<your-gemini-api-key>
 ```
 
 ---
 
-## 6. Run Evaluation Benchmark
+## 4. Evaluate v5 SFT LoRA (pending from last session)
 
-**BEFORE running**: make sure `evaluation/run_eval_runpod.py` points to the correct fine-tuned model on HuggingFace. Check this line:
-```
-grep "holos-medyk-merged" evaluation/run_eval_runpod.py
-```
-If it says the wrong version, fix it:
-```
-sed -i 's|kevpower/holos-medyk-merged-v2|kevpower/holos-medyk-merged-v3|' evaluation/run_eval_runpod.py
-```
-
-**Install eval deps** (if not already installed from training):
-```
-pip install git+https://github.com/huggingface/transformers.git accelerate sentencepiece
-```
-
-**Run the benchmark:**
-```
-python evaluation/run_eval_runpod.py
-```
-
-Run it directly (not nohup) so you can watch it. Takes ~20 minutes for 15 scenarios x 2 models.
-
----
-
-## 7. Save Eval Results to HuggingFace
+This loads the base model + your v5 LoRA adapter from HuggingFace and benchmarks
+both against 15 eval scenarios. No merged model needed.
 
 ```
-python -c "from huggingface_hub import HfApi; HfApi().upload_file(path_or_fileobj='evaluation/results/benchmark_results.json', path_in_repo='benchmark_results_v2.json', repo_id='kevpower/holos-medyk-merged-v2'); print('Done')"
+python evaluation/run_eval_unsloth.py
 ```
+
+Run directly (not nohup) so you can watch. Takes ~20 min for 15 scenarios × 2 models.
+
+If it errors on loading `kevpower/holos-medyk-lora-v5`, try loading the adapter
+manually to debug:
+
+```
+python -c "
+from unsloth import FastModel
+m, t = FastModel.from_pretrained('kevpower/holos-medyk-lora-v5', max_seq_length=2048, load_in_4bit=True)
+print('Loaded OK, type:', type(m))
+print('Params:', sum(p.numel() for p in m.parameters()))
+"
+```
+
+Results saved to `evaluation/results/benchmark_results.json`.
 
 ---
 
-## 8. STOP THE POD
+## 5. Train — GRPO
+
+GRPO uses 4 reward functions instead of teacher forcing:
+
+| Reward | What |
+|---|---|
+| No-refusal | Binary 0/1 — did you help or refuse? |
+| Correctness | Gemini 2.5 Flash judges response against clinical criteria (20 parallel workers) |
+| Similarity | Cosine similarity to teacher responses via sentence embeddings |
+| Format | Length sweet spot, no repetition, no filler |
+
+**Requires** `GOOGLE_API_KEY` for the LLM-as-judge correctness reward.
+
+```
+nohup python training/train_grpo.py > /workspace/grpo_log.txt 2>&1 &
+```
+
+```
+tail -f /workspace/grpo_log.txt
+```
+
+- Single pass through 266 examples, 4 generations each
+- ~1,064 Gemini Flash judge calls (20 concurrent, takes ~2 min of API time)
+- Expect ~30-60 min total on A100 (model generation is the bottleneck)
+- Watch the reward scores in the log — they should trend upward
+
+---
+
+## 6. Upload GRPO LoRA to HuggingFace
+
+```
+python -c "
+from huggingface_hub import HfApi
+api = HfApi()
+api.create_repo('kevpower/holos-medyk-grpo-v1', exist_ok=True)
+api.upload_folder(
+    folder_path='training/outputs/holos_medyk_grpo_v1/lora_adapter',
+    repo_id='kevpower/holos-medyk-grpo-v1',
+)
+print('Done')
+"
+```
+
+---
+
+## 7. Evaluate GRPO LoRA
+
+Update the eval script to point at the GRPO adapter:
+
+```
+sed -i 's|kevpower/holos-medyk-lora-v5|kevpower/holos-medyk-grpo-v1|' evaluation/run_eval_unsloth.py
+```
+
+```
+python evaluation/run_eval_unsloth.py
+```
+
+Results saved to `evaluation/results/benchmark_results.json`. Copy the old one first
+if you want to keep v5 results:
+
+```
+cp evaluation/results/benchmark_results.json evaluation/results/benchmark_results_v5.json
+```
+
+---
+
+## 8. Save Eval Results
+
+Upload to HuggingFace for safekeeping:
+
+```
+python -c "
+from huggingface_hub import HfApi
+HfApi().upload_file(
+    path_or_fileobj='evaluation/results/benchmark_results.json',
+    path_in_repo='benchmark_results_grpo_v1.json',
+    repo_id='kevpower/holos-medyk-grpo-v1',
+)
+print('Done')
+"
+```
+
+---
+
+## 9. STOP THE POD
 
 Go to https://www.runpod.io/console/pods and hit **Stop**.
 
 $1.49/hr adds up. Don't forget this.
+
+---
+
+## Typical Session Flows
+
+### Eval only (~25 min, ~$0.60)
+
+Steps: 1 → 2 → 3 → 4 → 9
+
+### GRPO train + eval (~90 min, ~$2.25)
+
+Steps: 1 → 2 → 3 → 5 → 6 → 7 → 8 → 9
 
 ---
 
@@ -142,22 +197,13 @@ $1.49/hr adds up. Don't forget this.
 | `Disk quota exceeded` during model download | Container disk too small. Use 50GB not 20GB. Also set `export HF_HOME=/workspace/hf_cache` |
 | `No module named 'unsloth'` | `pip install unsloth` |
 | `wandb: No API key configured` | `export WANDB_MODE=disabled` |
-| Training dies when laptop sleeps | Always use `nohup ... &`. Check with `tail -f /workspace/train_log.txt` |
-| GGUF export hangs on interactive prompt | Kill the process. LoRA + merged model are already saved. Convert GGUF locally later. |
-| `git clone` fails with auth error | Repo is public — don't enter username/password, just hit enter or use the raw URL |
+| Training dies when laptop sleeps | Always use `nohup ... &`. Check with `tail -f` |
+| GGUF export hangs on interactive prompt | Kill the process (`kill -9 $(pgrep -f train)`). LoRA is already saved. |
+| `git clone` fails with auth error | Repo is public — just hit enter, don't enter credentials |
 | Can't paste multi-line code into terminal | Write a script file locally, `git push`, then `git pull` on RunPod |
 | `HF_TOKEN` not working | Make sure it has **write** permission. Get from https://huggingface.co/settings/tokens |
-
----
-
-## Cost Tracking
-
-| Task | Time | Cost |
-|---|---|---|
-| Training (3 epochs, 3,511 examples) | ~35 min | ~$1 |
-| Model merge + upload | ~15 min | ~$0.40 |
-| Evaluation benchmark (15 scenarios x 2 models) | ~20 min | ~$0.50 |
-| **Typical full session** | **~70 min** | **~$2** |
+| `GOOGLE_API_KEY` errors | Get from https://aistudio.google.com/apikey or use Vertex AI service account |
+| FastModel can't load LoRA from HF | Check the repo exists: `huggingface-cli repo info kevpower/holos-medyk-lora-v5` |
 
 ---
 
@@ -166,13 +212,14 @@ $1.49/hr adds up. Don't forget this.
 | What | Where |
 |---|---|
 | Repo | `/workspace/holos-medyk/` |
-| Training script | `training/train_holos_medyk.py` |
-| Training data | `data/training/train_holos_medyk_v2.jsonl` |
-| LoRA adapter output | `training/outputs/holos_medyk_gemma4_e4b/lora_adapter/` |
-| Merged model output | `training/outputs/holos_medyk_gemma4_e4b/merged_16bit/` |
-| GGUF output (if successful) | `training/outputs/holos_medyk_gemma4_e4b/gguf_q4_k_m/` |
-| Training log | `/workspace/train_log.txt` |
-| Training metrics | `training/outputs/holos_medyk_gemma4_e4b/training_metrics.json` |
-| Eval script | `evaluation/run_eval_runpod.py` |
+| GRPO training script | `training/train_grpo.py` |
+| SFT training script (legacy) | `training/train_holos_medyk.py` |
+| Training data | `data/training/train_holos_medyk_v3_curated.jsonl` |
+| Teacher responses | `data/training/responses/*.jsonl` |
+| GRPO LoRA output | `training/outputs/holos_medyk_grpo_v1/lora_adapter/` |
+| SFT LoRA output (legacy) | `training/outputs/holos_medyk_gemma4_e4b/lora_adapter/` |
+| Training log | `/workspace/grpo_log.txt` |
+| Eval script (Unsloth) | `evaluation/run_eval_unsloth.py` |
+| Eval scenarios | `evaluation/eval_scenarios.jsonl` |
 | Eval results | `evaluation/results/benchmark_results.json` |
 | HF model cache | `/workspace/hf_cache/` |

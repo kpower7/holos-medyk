@@ -244,6 +244,66 @@ The evaluation script will be written in the same style as the Gemini 2.5 Pro te
 
 This section is the living log of the project. Each day we add a dated entry describing what was done, what was learned, and what comes next. The most recent entry sits at the top; older entries accumulate below. At the end of the project this changelog will be flattened into a chronological narrative for the final write-up.
 
+\subsection*{Day 6 --- 2026-04-09 (Wednesday): SFT abandoned, GRPO pivot, system prompt overhaul}
+
+\textbf{Summary.} After five failed SFT runs (v1--v5), the project pivots from supervised fine-tuning to Group Relative Policy Optimization (GRPO). Analysis showed the base Gemma~4 E4B already handles most emergency medical scenarios correctly; SFT degrades performance by overwriting good behavior to match 266 training examples. GRPO's reward-based approach reinforces desired behaviors (no refusals, clinical accuracy, MARCH ordering, concise format) without overwriting existing capabilities. A new GRPO training pipeline was built with four reward functions, including an LLM-as-judge via Gemini 2.5 Flash for clinical correctness scoring.
+
+\textbf{What was done.}
+
+\textit{SFT retrospective and pivot decision.}
+\begin{itemize}
+\item Reviewed all five SFT runs: v1 and v2 (3{,}511 examples) introduced generation looping and over-refusal; v3 and v4 (266 examples) caused catastrophic overfitting and model corruption; v5 (corrected LoRA targeting) completed training but evaluation on RunPod failed due to adapter loading issues.
+\item Core insight: the base model already scores $\sim$15/17 eval scenarios correctly. SFT fixes 3--4 clinical gaps but breaks generation quality across the board. The failure modes from SFT (looping, refusal, token ceiling hits) are worse than the baseline's gaps.
+\item Decision: abandon SFT, pivot to GRPO for behavioral reinforcement without overwriting base capabilities.
+\end{itemize}
+
+\textit{GRPO training pipeline (\texttt{training/train\_grpo.py}).}
+\begin{itemize}
+\item Built a complete GRPO training script using Unsloth's \texttt{FastModel} with \texttt{GRPOTrainer} from TRL. Same LoRA configuration as v5 (rank 8, alpha 8, text-only layers, vision/audio frozen).
+\item Four reward functions, each scoring 0.0--1.0:
+  \begin{enumerate}
+  \item \textbf{No-refusal} (binary): regex detection of refusal patterns (``I'm sorry, I cannot...'' / ``\foreignlanguage{ukrainian}{Вибачте, не можу...}'') and empty responses. Score 0 if refused, 1 if helped.
+  \item \textbf{Correctness} (LLM-as-judge): Gemini 2.5 Flash evaluates each response against clinical criteria. For the 17 eval scenarios, uses explicit criteria lists; for remaining 249 examples, sends the curated teacher response as reference. 20 parallel workers, $\sim$2 minutes for 1{,}064 judge calls.
+  \item \textbf{Similarity} (embedding cosine): sentence-transformers \texttt{all-MiniLM-L6-v2} computes cosine similarity between model output and teacher response. Linear mapping from raw similarity to 0--1 reward. Captures clinical content coverage but not structural ordering.
+  \item \textbf{Format}: three binary checks averaged --- response length in 200--1200 char sweet spot, no repetition loops ($\geq$3 repeats of 20+ char spans), no filler phrases.
+  \end{enumerate}
+\item Training config: single pass through 266 examples, 4 generations per prompt ($\sim$1{,}064 total completions), LR 5e-6, cosine schedule, \texttt{adamw\_8bit}.
+\end{itemize}
+
+\textit{System prompt overhaul.}
+\begin{itemize}
+\item Rewrote the system prompt across all six runtime and evaluation scripts to a single standardized version. Key additions over the original prompt:
+  \begin{itemize}
+  \item ``They have no medical training and no professional help available'' --- establishes context for the model's advice level.
+  \item ``Never refuse to help --- this person has no other option'' --- explicit anti-refusal framing.
+  \item ``with household materials'' --- constrains advice to what civilians actually have.
+  \item ``No disclaimers'' --- suppresses ``please consult a doctor'' filler.
+  \item Explicit MARCH priority chain: ``massive hemorrhage $\rightarrow$ airway $\rightarrow$ respiration $\rightarrow$ circulation/shock $\rightarrow$ head injury/hypothermia.''
+  \end{itemize}
+\item Removed \texttt{<thinking>} / \texttt{<answer>} tags from the \texttt{run\_eval.py} system prompt --- these caused generation looping in v1/v2 by teaching the model to literally output XML tags and cycle between them.
+\end{itemize}
+
+\textit{RunPod instructions rewrite.}
+\begin{itemize}
+\item Rewrote \texttt{RUNPOD\_INSTRUCTIONS.md} from scratch with two clean session flows: eval-only ($\sim$25 min, $\sim$\$0.60) and GRPO train + eval ($\sim$90 min, $\sim$\$2.25). Removed stale references to merged models, added \texttt{GOOGLE\_API\_KEY} setup for the judge, added debugging commands for LoRA adapter loading failures.
+\end{itemize}
+
+\textbf{What was learned.}
+\begin{itemize}
+\item \textbf{Reward function design requires uniform scales.} Early reward drafts had wildly asymmetric ranges (format: $-6$ to $+3$, correctness: $0$ to $+4$). This would have caused format violations to dominate the gradient signal over clinical correctness. All rewards were normalized to 0--1.
+\item \textbf{Keyword-based correctness is inadequate for medical advice.} The model says ``stop the leg bleeding before anything else,'' not ``hemorrhage first.'' Regex matching against clinical criteria strings fails on paraphrases. LLM-as-judge via Gemini Flash is the right tool --- fast, cheap (1{,}064 calls $\approx$ \$0.01), and handles both English and Ukrainian.
+\item \textbf{Embedding similarity captures content but not ordering.} Cosine similarity between ``tourniquet first, then airway'' and ``airway first, then tourniquet'' is nearly identical. MARCH ordering is instead captured implicitly by the teacher responses (which are already MARCH-ordered) via the LLM judge, which can evaluate sequential reasoning.
+\item \textbf{A strong base model needs reinforcement, not replacement.} GRPO's advantage: it compares 4 generations per prompt and reinforces the better ones. The model learns to do more of what it already does well, rather than memorizing 266 specific responses.
+\end{itemize}
+
+\textbf{What comes next (Day 7).}
+\begin{itemize}
+\item Run v5 SFT evaluation on RunPod to establish a complete SFT baseline.
+\item Run first GRPO training pass and evaluate against baseline.
+\item If GRPO improves clinical accuracy without degrading generation quality, iterate on reward weights and consider a second pass.
+\item Begin RAG/retrieval integration for shelter locations and city-specific protocols.
+\end{itemize}
+
 \subsection*{Day 5 --- 2026-04-07 (Monday): Curated dataset, training failures, and LoRA layer targeting discovery}
 
 \textbf{Summary.} Focused on three tasks: (1) building a 266-example curated training dataset via Claude Code subagents, (2) running two more failed SFT attempts (v3 and v4) that revealed a fundamental LoRA layer targeting error present in all previous training runs, and (3) fixing the training pipeline to use Unsloth's \texttt{FastModel} with \texttt{finetune\_vision\_layers=False}. The key discovery: all previous fine-tunes applied LoRA to the vision and audio encoder layers of the multimodal Gemma~4 architecture, not just the text decoder --- explaining the Unicode garbage, multilingual hallucinations, and generation collapse in v3/v4.
