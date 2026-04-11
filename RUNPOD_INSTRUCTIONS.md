@@ -1,6 +1,6 @@
 # RunPod — Step by Step
 
-Every time you need to train or benchmark on RunPod, follow these steps exactly.
+Fresh pod, clean start. No Unsloth — plain transformers + peft + trl.
 
 ---
 
@@ -23,7 +23,9 @@ Every time you need to train or benchmark on RunPod, follow these steps exactly.
 
 ---
 
-## 3. Setup (run these one at a time)
+## 3. Setup
+
+Run these one at a time. Copy-paste each block individually.
 
 ```
 cd /workspace
@@ -59,45 +61,51 @@ export GOOGLE_API_KEY=<your-gemini-api-key>
 
 ---
 
-## 4. Evaluate v5 SFT LoRA (pending from last session)
+## 4. Smoke test (run this BEFORE training)
 
-This loads the base model + your v5 LoRA adapter from HuggingFace and benchmarks
-both against 15 eval scenarios. No merged model needed.
-
-```
-python evaluation/run_eval_unsloth.py
-```
-
-Run directly (not nohup) so you can watch. Takes ~20 min for 15 scenarios × 2 models.
-
-If it errors on loading `kevpower/holos-medyk-lora-v5`, try loading the adapter
-manually to debug:
+Verify everything imports and the model loads:
 
 ```
 python -c "
-from unsloth import FastModel
-m, t = FastModel.from_pretrained('kevpower/holos-medyk-lora-v5', max_seq_length=2048, load_in_4bit=True)
-print('Loaded OK, type:', type(m))
-print('Params:', sum(p.numel() for p in m.parameters()))
+import torch
+print('torch:', torch.__version__, '| CUDA:', torch.cuda.is_available())
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+print('transformers OK')
+
+from peft import LoraConfig
+print('peft OK')
+
+from trl import GRPOConfig, GRPOTrainer
+print('trl GRPOTrainer OK')
+
+from sentence_transformers import SentenceTransformer
+print('sentence-transformers OK')
+
+from google import genai
+client = genai.Client()
+r = client.models.generate_content(model='gemini-2.5-flash', contents='Say OK')
+print('Gemini judge OK:', r.text[:20])
+
+print()
+print('=== ALL IMPORTS PASSED ===')
 "
 ```
 
-Results saved to `evaluation/results/benchmark_results.json`.
+If any import fails, fix it before proceeding. If Gemini fails, check your GOOGLE_API_KEY.
 
 ---
 
 ## 5. Train — GRPO
 
-GRPO uses 4 reward functions instead of teacher forcing:
+GRPO with 4 reward functions. No Unsloth — plain transformers + peft + trl.
 
 | Reward | What |
 |---|---|
 | No-refusal | Binary 0/1 — did you help or refuse? |
-| Correctness | Gemini 2.5 Flash judges response against clinical criteria (20 parallel workers) |
-| Similarity | Cosine similarity to teacher responses via sentence embeddings |
-| Format | Length sweet spot, no repetition, no filler |
-
-**Requires** `GOOGLE_API_KEY` for the LLM-as-judge correctness reward.
+| Correctness | Gemini 2.5 Flash judges response (20 parallel workers) |
+| Similarity | Cosine sim to teacher responses (sentence embeddings) |
+| Format | Length, no repetition, no filler |
 
 ```
 nohup python training/train_grpo.py > /workspace/grpo_log.txt 2>&1 &
@@ -107,10 +115,20 @@ nohup python training/train_grpo.py > /workspace/grpo_log.txt 2>&1 &
 tail -f /workspace/grpo_log.txt
 ```
 
-- Single pass through 266 examples, 4 generations each
-- ~1,064 Gemini Flash judge calls (20 concurrent, takes ~2 min of API time)
-- Expect ~30-60 min total on A100 (model generation is the bottleneck)
-- Watch the reward scores in the log — they should trend upward
+**What to watch for:**
+
+- Model loads in ~1-2 min (16GB download first time)
+- `LoRA config: text decoder only` — confirms vision/audio excluded
+- `Initializing GRPO trainer...` — means config accepted
+- `Starting GRPO training...` — generation begins
+- Reward scores should appear per step and trend upward
+- Single pass through 266 examples, 4 generations each (~1,064 judge calls)
+- Expected time: ~30-60 min on A100
+
+**If it errors:** Check the error, fix locally, `git push`, then on RunPod:
+```
+pkill -9 -f train_grpo ; git pull && nohup python training/train_grpo.py > /workspace/grpo_log.txt 2>&1 & tail -f /workspace/grpo_log.txt
+```
 
 ---
 
@@ -131,62 +149,11 @@ print('Done')
 
 ---
 
-## 7. Evaluate GRPO LoRA
-
-Update the eval script to point at the GRPO adapter:
-
-```
-sed -i 's|kevpower/holos-medyk-lora-v5|kevpower/holos-medyk-grpo-v1|' evaluation/run_eval_unsloth.py
-```
-
-```
-python evaluation/run_eval_unsloth.py
-```
-
-Results saved to `evaluation/results/benchmark_results.json`. Copy the old one first
-if you want to keep v5 results:
-
-```
-cp evaluation/results/benchmark_results.json evaluation/results/benchmark_results_v5.json
-```
-
----
-
-## 8. Save Eval Results
-
-Upload to HuggingFace for safekeeping:
-
-```
-python -c "
-from huggingface_hub import HfApi
-HfApi().upload_file(
-    path_or_fileobj='evaluation/results/benchmark_results.json',
-    path_in_repo='benchmark_results_grpo_v1.json',
-    repo_id='kevpower/holos-medyk-grpo-v1',
-)
-print('Done')
-"
-```
-
----
-
-## 9. STOP THE POD
+## 7. STOP THE POD
 
 Go to https://www.runpod.io/console/pods and hit **Stop**.
 
 $1.49/hr adds up. Don't forget this.
-
----
-
-## Typical Session Flows
-
-### Eval only (~25 min, ~$0.60)
-
-Steps: 1 → 2 → 3 → 4 → 9
-
-### GRPO train + eval (~90 min, ~$2.25)
-
-Steps: 1 → 2 → 3 → 5 → 6 → 7 → 8 → 9
 
 ---
 
@@ -195,15 +162,13 @@ Steps: 1 → 2 → 3 → 5 → 6 → 7 → 8 → 9
 | Problem | Fix |
 |---|---|
 | `Disk quota exceeded` during model download | Container disk too small. Use 50GB not 20GB. Also set `export HF_HOME=/workspace/hf_cache` |
-| `No module named 'unsloth'` | `pip install unsloth` |
 | `wandb: No API key configured` | `export WANDB_MODE=disabled` |
 | Training dies when laptop sleeps | Always use `nohup ... &`. Check with `tail -f` |
-| GGUF export hangs on interactive prompt | Kill the process (`kill -9 $(pgrep -f train)`). LoRA is already saved. |
 | `git clone` fails with auth error | Repo is public — just hit enter, don't enter credentials |
-| Can't paste multi-line code into terminal | Write a script file locally, `git push`, then `git pull` on RunPod |
 | `HF_TOKEN` not working | Make sure it has **write** permission. Get from https://huggingface.co/settings/tokens |
-| `GOOGLE_API_KEY` errors | Get from https://aistudio.google.com/apikey or use Vertex AI service account |
-| FastModel can't load LoRA from HF | Check the repo exists: `huggingface-cli repo info kevpower/holos-medyk-lora-v5` |
+| `GOOGLE_API_KEY` errors | Get from https://aistudio.google.com/apikey |
+| `ClippableLinear` or peft errors | Should be handled by monkey-patch in train_grpo.py. If not, `pip install --upgrade peft` |
+| Gemini 429 rate limit | Built-in retry (5 attempts, exponential backoff). If persistent, reduce JUDGE_WORKERS in script |
 
 ---
 
@@ -213,13 +178,20 @@ Steps: 1 → 2 → 3 → 5 → 6 → 7 → 8 → 9
 |---|---|
 | Repo | `/workspace/holos-medyk/` |
 | GRPO training script | `training/train_grpo.py` |
-| SFT training script (legacy) | `training/train_holos_medyk.py` |
 | Training data | `data/training/train_holos_medyk_v3_curated.jsonl` |
 | Teacher responses | `data/training/responses/*.jsonl` |
 | GRPO LoRA output | `training/outputs/holos_medyk_grpo_v1/lora_adapter/` |
-| SFT LoRA output (legacy) | `training/outputs/holos_medyk_gemma4_e4b/lora_adapter/` |
 | Training log | `/workspace/grpo_log.txt` |
-| Eval script (Unsloth) | `evaluation/run_eval_unsloth.py` |
 | Eval scenarios | `evaluation/eval_scenarios.jsonl` |
 | Eval results | `evaluation/results/benchmark_results.json` |
 | HF model cache | `/workspace/hf_cache/` |
+
+---
+
+## Cost Tracking
+
+| Task | Time | Cost |
+|---|---|---|
+| GRPO training (1 epoch, 266 examples) | ~30-60 min | ~$1-1.50 |
+| Model upload to HF | ~5 min | ~$0.15 |
+| **Typical session** | **~45-70 min** | **~$1.50-2** |
