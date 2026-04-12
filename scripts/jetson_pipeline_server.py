@@ -221,6 +221,7 @@ class TTS:
         try:
             audio = self.model.apply_tts(
                 text=text,
+                speaker="mykyta",
                 sample_rate=self.sample_rate,
             )
             audio_np = audio.numpy()
