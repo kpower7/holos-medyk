@@ -369,6 +369,11 @@ This section is the living log of the project. Each day we add a dated entry des
 \item \textbf{12.1 tok/s is usable for a voice assistant.} A typical 200--400 character response ($\sim$50--100 tokens) takes 4--8 seconds. Human speech is $\sim$150 words/min ($\sim$3 tok/s), so the model generates 4$\times$ faster than someone can listen. TTS playback is the real bottleneck, not generation speed.
 \item \textbf{Headless mode unnecessary after r36.5.} The 800~MB savings from disabling the GUI was a workaround for the cudaMalloc bug. With r36.5, the model (5.34~GB) + KV cache ($\sim$0.5~GB at \texttt{-c 2048}) fits with $\sim$1.7~GB to spare even with the desktop running. Keep the GUI for easier Bluetooth management and debugging.
 \item \textbf{JetPack's PulseAudio lacks Bluetooth audio out of the box.} \texttt{pulseaudio-module-bluetooth} is not pre-installed. Without it, \texttt{bluetoothctl connect} succeeds at the link level but fails with \texttt{br-connection-profile-unavailable} because no A2DP/HFP profile handler exists. One \texttt{apt install} fixes it.
+\item \textbf{PulseAudio rejects SSH connections by default.} \texttt{parecord}, \texttt{paplay}, \texttt{pactl}, and Python \texttt{sounddevice} all fail from SSH. Fix: \texttt{pacmd load-module module-native-protocol-tcp auth-anonymous=1} to enable TCP access, then \texttt{export PULSE\_SERVER=tcp:127.0.0.1} in the SSH session.
+\item \textbf{Subprocess-per-call LLM inference is fundamentally incompatible with voice pipelines.} The 70~s model load overhead per prompt kills the experience. \texttt{llama-server} HTTP API keeps the model resident in GPU memory; subsequent calls hit prompt cache and respond in 3-4~s. This architectural choice is 20--40$\times$ faster than subprocess mode.
+\item \textbf{Streaming is a requirement, not an optimization, for voice output.} Without streaming, the LLM finishes generating all 300+ tokens before any are visible or playable. With streaming, the first sentence appears in $<$1~s and TTS can start on it immediately. Time-to-first-audio dominates perceived latency.
+\item \textbf{Gemma 4 thinking mode needs budget headroom.} The model reasons internally before answering. Budget it too tightly (\texttt{max\_tokens=512} on 2048 context) and it occasionally spends the entire budget on thinking with zero tokens for the response --- manifesting as a random empty-output bug. \texttt{max\_tokens=1024} + temperature 0.7 eliminates it.
+\item \textbf{TTS quality matters for the warzone use case.} A civilian under bombardment listening to robotic espeak will not trust the instructions. Silero v4\_ua failed silently on English input; \texttt{robinhad/ukrainian-tts} with the Tetiana voice produces natural, trustworthy Ukrainian speech with auto-stress marking.
 \end{itemize}
 
 \textit{Jetson voice pipeline.}
@@ -378,6 +383,23 @@ This section is the living log of the project. Each day we add a dated entry des
 \item Tested LLM in text-only mode: model produced clinically correct hemorrhage response (``DO NOT pull the glass out... Press down hard on the wound... tourniquet...'') with thinking trace. 13.4~t/s generation.
 \item Identified cold-start problem: \texttt{--single-turn} mode reloads the 5.34~GB model for every prompt ($\sim$70s loading overhead on each call). Created a second pipeline variant (\texttt{jetson\_pipeline\_server.py}) that calls \texttt{llama-server} HTTP API instead --- model stays resident in GPU memory, first token in $<$1s after warmup.
 \item Response parsing proved fragile: the model's output format varies (sometimes thinking blocks, sometimes not, different markers). The server-based pipeline eliminates this entirely --- \texttt{/v1/chat/completions} returns clean JSON with just the response text.
+\end{itemize}
+
+\textit{Voice pipeline: server mode with streaming.}
+\begin{itemize}
+\item First attempt with \texttt{jetson\_pipeline.py} (subprocess-per-call) confirmed the cold start problem: every prompt reloaded the 5.34~GB model, taking $\sim$70~s before generation even started. First response landed at 116.8~s total. Unusable for a voice loop.
+\item Switched to \texttt{llama-server} HTTP API. Started once with: \texttt{\~{}/llama.cpp/build/bin/llama-server -m \~{}/models/gemma-4-e4b-it-Q4\_K\_M.gguf -ngl 99 -c 2048 --port 8080}. Server logs showed $\sim$4994~MiB GPU free after model load, 4 parallel slots ready.
+\item First HTTP call: 31.5~s wall-clock, 28~t/s prompt processing, 12.7~t/s generation, 340 tokens. Subsequent calls hit the prompt cache (LCP similarity 1.0) and ran in 4.4~s. Dramatic improvement.
+\item Added streaming via \texttt{"stream": true} in the OpenAI-compatible payload. Tokens arrive as server-sent events (\texttt{data: \{\ldots\}}) from \texttt{/v1/chat/completions}. The pipeline now writes each token to stdout as it arrives --- essential for voice pipelines where we can start TTS on the first sentence while the rest streams.
+\item \textbf{Discovered thinking-mode overflow bug.} Gemma~4 does internal thinking before responding. At \texttt{max\_tokens=512}, the model sometimes spent the entire budget on thinking with zero tokens remaining for the actual answer --- producing an empty response after 40+ seconds. Non-deterministic: same prompt could give perfect output once and empty output the next run at temperature 1.0.
+\item \textbf{Fix: \texttt{max\_tokens=1024} and temperature 0.7.} Provides enough budget for thinking plus a full answer, with lower variance in thinking length. After this change, every test run produced a clean response in 3-4~s.
+\end{itemize}
+
+\textit{TTS: Silero rejected, robinhad/ukrainian-tts adopted.}
+\begin{itemize}
+\item First tried Silero v4\_ua (the current best Silero Ukrainian). Required \texttt{pip install omegaconf} (not a listed dependency), correct speaker name (\texttt{"mykyta"}, not \texttt{"random"}), and removal of \texttt{model.eval()} call (Silero's \texttt{TTSModelMultiAcc\_v3} isn't a standard \texttt{nn.Module}).
+\item Silero failed silently on English-containing text --- the model call raised an exception with no message. Since the base model currently responds in English unless explicitly prompted in Ukrainian, Silero is unusable without language detection + translation.
+\item Switched to \texttt{robinhad/ukrainian-tts} (the Day~5 TTS comparison winner for Ukrainian quality). Installed via \texttt{pip install git+https://github.com/robinhad/ukrainian-tts.git}. Auto-downloads model weights ($\sim$300~MB), stanza Ukrainian corpus, and NLTK data on first run. Uses the Tetiana voice by default with dictionary-based stress marking.
 \end{itemize}
 
 \textit{Design exploration: beacon mode.}

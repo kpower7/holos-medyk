@@ -681,7 +681,60 @@ paplay /tmp/test_bt.wav
 - **`PortAudio library not found` in Python:** `sudo apt install libportaudio2`.
 - **`sounddevice` doesn't show Bluetooth devices:** Need `libasound2-plugins` for the PulseAudio ALSA plugin, plus `~/.asoundrc` routing to pulse, plus `PULSE_SERVER=tcp:127.0.0.1`.
 
-### 3.14 Restoring the Jetson to normal desktop use
+### 3.14 Voice pipeline setup
+
+Two pipeline scripts are provided:
+
+| Script | Use case |
+|---|---|
+| `scripts/jetson_pipeline.py` | Standalone (subprocess-per-call). ~70s cold start each call. |
+| `scripts/jetson_pipeline_server.py` | **Preferred.** Uses llama-server HTTP API. Model stays loaded. ~3-4s per response. |
+
+**One-time Python env setup:**
+
+```bash
+sudo apt install python3.10-venv libportaudio2 -y
+python3 -m venv ~/holos-env
+source ~/holos-env/bin/activate
+pip install --upgrade pip
+pip install numpy sounddevice soundfile faster-whisper silero-vad omegaconf
+pip install git+https://github.com/robinhad/ukrainian-tts.git
+```
+
+**Starting the pipeline (server mode, recommended):**
+
+Terminal 1 (server — keep running):
+```bash
+~/llama.cpp/build/bin/llama-server \
+  -m ~/models/gemma-4-e4b-it-Q4_K_M.gguf \
+  -ngl 99 -c 2048 --port 8080
+```
+
+Wait for `main: server is listening on http://127.0.0.1:8080`.
+
+Terminal 2 (pipeline):
+```bash
+source ~/holos-env/bin/activate
+cd ~/holos-medyk && git pull
+export PULSE_SERVER=tcp:127.0.0.1
+python3 scripts/jetson_pipeline_server.py
+```
+
+**Testing without audio (text-only, no-TTS):**
+```bash
+python3 scripts/jetson_pipeline_server.py --text "My daughter has glass in her arm" --no-tts
+```
+
+### 3.15 Voice pipeline key lessons
+
+- **llama.cpp subprocess mode reloads the model every call** (~70s cold start). Unusable for a voice loop. Use `llama-server` HTTP API instead.
+- **Use streaming (`stream: true`) for voice pipelines.** Without streaming, the client waits for the full response before displaying anything. With streaming, tokens appear immediately and TTS can start on the first sentence while the rest is still generating.
+- **Gemma 4 thinking mode needs `max_tokens >= 1024`** on 2048 context. At 512, the model sometimes uses the entire budget on thinking with zero tokens left for the actual response (empty output). 1024 gives room for both thinking + answer.
+- **Lower temperature (0.7) gives more consistent thinking length** than 1.0. Still uses thinking, but less likely to spiral into long reasoning chains.
+- **TTS: use robinhad/ukrainian-tts, NOT Silero v4_ua.** Silero fails silently on English-containing text. robinhad auto-stresses Ukrainian and has a real Ukrainian woman voice (Tetiana). Install: `pip install git+https://github.com/robinhad/ukrainian-tts.git`.
+- **The response parser matters less in server mode.** `/v1/chat/completions` returns clean text in `message.content` — no need to grep stdout.
+
+### 3.16 Restoring the Jetson to normal desktop use
 
 When you're done with the Holos Medyk project and want the Jetson back as a normal desktop machine:
 
@@ -692,7 +745,7 @@ sudo reboot
 
 This restores the Ubuntu GUI on boot. **Do this before shelving the device** — otherwise the next time you power it on you'll get a text console with no obvious way to get the desktop back.
 
-### 3.14 Common pitfalls on Jetson
+### 3.17 Common pitfalls on Jetson
 
 - **Black screen on first boot with JetPack 6.2 SD card.** Firmware is too old. You must go through the JetPack 5.1.3 intermediate update first. See Step 2–5 above.
 - **No HDMI port.** DisplayPort only. Use a DP-to-HDMI adapter (active recommended).
