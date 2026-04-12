@@ -188,20 +188,25 @@ class LLM:
         """Extract the response text from llama-cli --single-turn output."""
         lines = raw_output.split("\n")
 
-        # Find the "> " prompt echo line, then capture everything until "[ Prompt:" or "Exiting..."
-        capture = False
-        response_lines = []
-        for line in lines:
+        # Strategy: find [End thinking], capture everything after it until stats/exit.
+        # If no thinking block, capture everything after "> " prompt echo.
+        end_thinking_idx = -1
+        prompt_echo_idx = -1
+        for i, line in enumerate(lines):
+            if "[End thinking]" in line:
+                end_thinking_idx = i
             if line.startswith("> "):
-                capture = True
-                continue
-            if capture:
-                if "[ Prompt:" in line or "Exiting..." in line:
-                    break
-                # Skip thinking blocks
-                if "[Start thinking]" in line or "[End thinking]" in line:
-                    continue
-                response_lines.append(line)
+                prompt_echo_idx = i
+
+        start = end_thinking_idx + 1 if end_thinking_idx >= 0 else prompt_echo_idx + 1
+        if start <= 0:
+            return raw_output.strip()
+
+        response_lines = []
+        for line in lines[start:]:
+            if "[ Prompt:" in line or "Exiting..." in line:
+                break
+            response_lines.append(line)
 
         return "\n".join(response_lines).strip()
 
