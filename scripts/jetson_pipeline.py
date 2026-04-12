@@ -175,7 +175,7 @@ class LLM:
                     "-f", tmp.name,
                 ],
                 capture_output=True,
-                timeout=120,
+                timeout=300,
             )
 
             output = result.stdout.decode("utf-8", errors="replace")
