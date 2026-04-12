@@ -181,6 +181,7 @@ class LLM:
             "temperature": 1.0,
             "top_p": 0.95,
             "top_k": 64,
+            "stream": True,
         }).encode("utf-8")
 
         req = Request(
@@ -191,10 +192,44 @@ class LLM:
 
         try:
             resp = urlopen(req, timeout=120)
-            result = json.loads(resp.read())
-            return result["choices"][0]["message"]["content"].strip()
+            full_text = ""
+            thinking = True  # Skip thinking tokens at the start
+            for raw_line in resp:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = chunk["choices"][0]["delta"]
+                    token = delta.get("content", "")
+                    if not token:
+                        continue
+                    # Detect end of thinking
+                    if thinking:
+                        full_text += token
+                        if "[End thinking]" in full_text or "<end_of_thought>" in full_text:
+                            thinking = False
+                            # Strip everything up to and including the marker
+                            for marker in ["[End thinking]", "<end_of_thought>"]:
+                                if marker in full_text:
+                                    full_text = full_text.split(marker)[-1]
+                            sys.stdout.write(full_text)
+                            sys.stdout.flush()
+                        continue
+                    full_text += token
+                    sys.stdout.write(token)
+                    sys.stdout.flush()
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+            print()  # Newline after streaming
+            return full_text.strip()
         except Exception as e:
+            import traceback
             print(f"[LLM] Error: {e}")
+            traceback.print_exc()
             return ""
 
 
