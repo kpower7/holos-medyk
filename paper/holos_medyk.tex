@@ -304,6 +304,65 @@ This section is the living log of the project. Each day we add a dated entry des
 \item Consider purchasing an NVMe SSD (M.2 2280) for swap and faster model loading if memory pressure becomes an issue during the full voice pipeline (LLM + ASR + TTS simultaneously).
 \end{itemize}
 
+\subsection*{Day 8 --- 2026-04-12 (Saturday): JetPack upgrade, cudaMalloc fix, first Jetson inference}
+
+\textbf{Summary.} Fixed the blocking JetPack r36.4.7 CUDA memory allocation bug via APT upgrade to JetPack 6.2.2 (r36.5). First successful Gemma~4 E4B inference on the Jetson Orin Nano: 12.1~tok/s generation with full GPU offload. Also encountered and documented Wi-Fi connectivity issues when moving to a new development workstation.
+
+\textbf{What was done.}
+
+\textit{Network connectivity from new workstation.}
+\begin{itemize}
+\item Moved development to a second laptop (home workstation). The Jetson was already in headless mode (\texttt{multi-user.target}) from Day~7 --- no display output on boot, SSH-only access.
+\item Home Wi-Fi: both the Jetson and laptop were on the same \texttt{192.168.2.x} subnet (Jetson at \texttt{192.168.2.98}). The Jetson could ping \texttt{8.8.8.8} (internet) and confirmed \texttt{wlP1p1s0} connected, but the laptop could not ping or SSH to the Jetson --- \texttt{ping 192.168.2.98} returned ``Destination host unreachable.'' Root cause: \textbf{router AP isolation} (client isolation) --- a common home router default that prevents Wi-Fi devices from communicating with each other on the same network.
+\item \textbf{Workaround: phone hotspot again.} Same solution as Day~7. Both devices joined a mobile hotspot. Jetson connected via \texttt{sudo nmcli device wifi connect <SSID> password <PASS>}. Required \texttt{sudo nmcli device wifi rescan} before the hotspot appeared in \texttt{nmcli device wifi list}. Jetson IP: \texttt{172.20.10.5}. SSH established successfully.
+\item Note: after reboot in headless mode, the Jetson does not auto-reconnect to Wi-Fi hotspots. Must reconnect manually via physical keyboard (blind-typing login credentials on headless console) or by temporarily restoring the display manager.
+\end{itemize}
+
+\textit{JetPack 6.2.2 (r36.5) upgrade via APT --- cudaMalloc fix.}
+\begin{itemize}
+\item Researched the \texttt{cudaMalloc} bug in detail. Root cause: a regression in NVIDIA's NvMap kernel driver (kernel 5.15.185-tegra) shipped with JetPack 6.2 (r36.4.7). The NvMap driver fails to allocate contiguous physical memory regions for GPU use, even when sufficient total free memory exists. This is a known bug with a 260+ reply thread on NVIDIA Developer Forums. Affects all CUDA applications (llama.cpp, Ollama, PyTorch).
+\item Confirmed JetPack 6.2.2 (Jetson Linux r36.5, released February 2026) contains the fix. Upgrade is possible via APT without reflashing.
+\item Performed the upgrade:
+  \begin{enumerate}
+  \item Edited \texttt{/etc/apt/sources.list.d/nvidia-l4t-apt-source.list}: changed all three \texttt{r36.4} references to \texttt{r36.5} using \texttt{sed -i 's/r36.4/r36.5/g'}.
+  \item \texttt{sudo apt update \&\& sudo apt dist-upgrade -y}. Answered \texttt{N} (keep current) for \texttt{nv-oem-config-post.sh} and \texttt{N} for \texttt{nvidia-l4t-apt-source.list} (already manually edited to r36.5).
+  \item Upgrade was interrupted during the \texttt{Processing triggers} phase (post-install cleanup). Recovered with \texttt{sudo dpkg --configure -a} and \texttt{sudo apt --fix-broken install -y}.
+  \item Rebooted. Confirmed upgrade: \texttt{cat /etc/nv\_tegra\_release} shows \texttt{R36, REVISION: 5.0, GCID: 43688277, DATE: Fri Jan 16 03:50:45 UTC 2026}.
+  \end{enumerate}
+\item After reboot, monitor showed no output --- expected behavior in headless mode. Reconnected via SSH through phone hotspot.
+\end{itemize}
+
+\textit{First successful inference on Jetson.}
+\begin{itemize}
+\item Ran Gemma~4 E4B (Q4\_K\_M, 5.34~GB) with full GPU offload (\texttt{-ngl 99}):
+\begin{verbatim}
+~/llama.cpp/build/bin/llama-cli \
+  -m ~/models/gemma-4-e4b-it-Q4_K_M.gguf \
+  -ngl 99 -c 2048 -n 128 \
+  -p "Hello, how are you?"
+\end{verbatim}
+\item \textbf{Result: success.} GPU detected correctly (``Orin, compute capability 8.7, VMM: yes, VRAM: 7607 MiB''). Model loaded, \texttt{cudaMalloc} succeeded. Generated a coherent response.
+\item \textbf{Performance: 10.4~t/s prompt processing, 12.1~t/s generation.} This is slower than the estimated 20--35~t/s from the Day~7 SETUP.md, but the model is generating at interactive speed --- a full 128-token response completes in $\sim$10 seconds. Likely improvable with \texttt{-fa} (flash attention) and \texttt{jetson\_clocks}.
+\item Compared to other platforms: the Pi~5 takes $\sim$2 minutes per response (CPU only). The Jetson produces a response in $\sim$10 seconds. The Windows laptop (RTX A1000 6GB, Q3\_K\_M) generates at $\sim$30~t/s but uses a lower quantization.
+\end{itemize}
+
+\textbf{What was learned.}
+\begin{itemize}
+\item \textbf{JetPack r36.4.7 NvMap bug is real and the APT upgrade to r36.5 fixes it cleanly.} No reflash needed. The upgrade took $\sim$15 minutes plus a reboot. The interrupted \texttt{apt dist-upgrade} was recoverable with \texttt{dpkg --configure -a}.
+\item \textbf{Home Wi-Fi router AP isolation blocks device-to-device communication.} Both devices on the same subnet, both online, but the router prevents them from seeing each other. Phone hotspot remains the reliable workaround. A permanent fix requires disabling AP isolation in router settings.
+\item \textbf{Headless Jetson does not auto-reconnect to Wi-Fi after reboot.} This is a significant operational annoyance --- after every reboot you need physical keyboard access (or a pre-configured \texttt{nmcli connection} with \texttt{autoconnect yes}) to re-establish the SSH path.
+\item \textbf{12.1 tok/s is usable for a voice assistant.} A typical 200--400 character response ($\sim$50--100 tokens) takes 4--8 seconds. Combined with TTS latency, total response time should be $\sim$6--12 seconds --- not instant, but acceptable for a warzone scenario where the user is actively performing first aid and waiting for the next instruction.
+\end{itemize}
+
+\textbf{What comes next (Day 9).}
+\begin{itemize}
+\item Test with the full Ukrainian medical system prompt via \texttt{-f} file to confirm multilingual generation quality and response structure.
+\item Optimize Jetson inference: enable flash attention (\texttt{-fa}), run \texttt{sudo jetson\_clocks} to maximize GPU clock, test with \texttt{-c 1024} (smaller context) to free memory for KV cache.
+\item Test the GRPO Colab notebook (\texttt{training/holos\_medyk\_grpo\_colab.ipynb}) --- the training pipeline is ready but untested.
+\item Set up auto-reconnect for the Jetson Wi-Fi to survive reboots: \texttt{nmcli connection modify <conn> connection.autoconnect yes}.
+\item Begin adapting the voice pipeline for Jetson: ASR (whisper.cpp with CUDA or Gemma~4 native audio), TTS (Silero V5 Ukrainian), audio I/O (USB adapter + PulseAudio).
+\end{itemize}
+
 \subsection*{Day 6 --- 2026-04-09 (Wednesday): SFT abandoned, GRPO pivot, system prompt overhaul}
 
 \textbf{Summary.} After five failed SFT runs (v1--v5), the project pivots from supervised fine-tuning to Group Relative Policy Optimization (GRPO). Analysis showed the base Gemma~4 E4B already handles most emergency medical scenarios correctly; SFT degrades performance by overwriting good behavior to match 266 training examples. GRPO's reward-based approach reinforces desired behaviors (no refusals, clinical accuracy, MARCH ordering, concise format) without overwriting existing capabilities. A new GRPO training pipeline was built with four reward functions, including an LLM-as-judge via Gemini 2.5 Flash for clinical correctness scoring.
