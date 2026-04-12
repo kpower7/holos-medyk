@@ -185,44 +185,25 @@ class LLM:
             os.unlink(tmp.name)
 
     def _parse_response(self, raw_output):
-        """Extract the response text, skipping llama.cpp system output and thinking."""
+        """Extract the response text from llama-cli --single-turn output."""
         lines = raw_output.split("\n")
-        response_lines = []
-        in_response = False
 
+        # Find the "> " prompt echo line, then capture everything until "[ Prompt:" or "Exiting..."
+        capture = False
+        response_lines = []
         for line in lines:
-            # Skip llama.cpp system lines
-            if any(line.startswith(p) for p in (
-                "ggml_", "load_", "llama_", "Loading model", "build ", "model ",
-                "modalities", "available commands", "> ", "[Start thinking]",
-                "  ", "\u2584", "\u2588", "\u2580",
-            )):
+            if line.startswith("> "):
+                capture = True
                 continue
-            if "[End thinking]" in line:
-                in_response = True
-                continue
-            if "[ Prompt:" in line or "Exiting..." in line:
-                break
-            if in_response:
+            if capture:
+                if "[ Prompt:" in line or "Exiting..." in line:
+                    break
+                # Skip thinking blocks
+                if "[Start thinking]" in line or "[End thinking]" in line:
+                    continue
                 response_lines.append(line)
 
-        response = "\n".join(response_lines).strip()
-
-        # Fallback: grab everything after the model's generation start
-        if not response:
-            capture = False
-            clean_lines = []
-            for line in lines:
-                if line.startswith("> ") or line.startswith("<start_of_turn>model"):
-                    capture = True
-                    continue
-                if capture:
-                    if "[ Prompt:" in line or "Exiting..." in line or line.startswith("llama_"):
-                        break
-                    clean_lines.append(line)
-            response = "\n".join(clean_lines).strip()
-
-        return response
+        return "\n".join(response_lines).strip()
 
 
 # ── TTS (Silero v4 Ukrainian) ─────────────────────────────────────────────
