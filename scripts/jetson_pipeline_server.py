@@ -1,6 +1,6 @@
 """
 Holos Medyk — Jetson Orin Nano Voice Pipeline (Server Mode)
-Mic (Bluetooth) → VAD → ASR (faster-whisper) → LLM (llama-server HTTP) → TTS (Silero v4 Ukrainian) → Speaker (Bluetooth)
+Mic (Bluetooth) → VAD → ASR (faster-whisper) → LLM (llama-server HTTP) → TTS (robinhad ukrainian-tts) → Speaker (Bluetooth)
 
 Requires llama-server running separately:
     ~/llama.cpp/build/bin/llama-server -m ~/models/gemma-4-e4b-it-Q4_K_M.gguf -ngl 99 -c 2048 --port 8080
@@ -198,39 +198,36 @@ class LLM:
             return ""
 
 
-# ── TTS (Silero v4 Ukrainian) ─────────────────────────────────────────────
+# ── TTS (robinhad ukrainian-tts) ──────────────────────────────────────────
 
 class TTS:
-    """Text-to-speech using Silero v4 Ukrainian via torch.hub."""
+    """Text-to-speech using robinhad/ukrainian-tts (ESPnet, Tetiana voice)."""
 
-    def __init__(self, sample_rate=48000):
-        import torch
-        self.torch = torch
-        self.sample_rate = sample_rate
-        print("[TTS] Loading Silero v4_ua...")
-        self.model, _ = torch.hub.load(
-            repo_or_dir="snakers4/silero-models",
-            model="silero_tts",
-            language="ua",
-            speaker="v4_ua",
-        )
-        print("[TTS] Silero v4_ua loaded")
+    def __init__(self, voice="Tetiana"):
+        from ukrainian_tts.tts import TTS as UkrTTS, Voices, Stress
+        self.Voices = Voices
+        self.Stress = Stress
+        self.voice = getattr(Voices, voice).value
+        print(f"[TTS] Loading ukrainian-tts ({voice})...")
+        self.engine = UkrTTS(device="cpu")
+        print(f"[TTS] ukrainian-tts loaded")
 
     def speak(self, text):
         """Synthesize and play speech."""
         try:
-            audio = self.model.apply_tts(
-                text=text,
-                speaker="mykyta",
-                sample_rate=self.sample_rate,
-            )
-            audio_np = audio.numpy()
-            duration = len(audio_np) / self.sample_rate
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            _, accented = self.engine.tts(text, self.voice, self.Stress.Dictionary.value, open(tmp.name, "wb"))
+            data, sr = sf.read(tmp.name)
+            duration = len(data) / sr
             print(f"    Speaking ({duration:.1f}s)...")
-            sd.play(audio_np, self.sample_rate)
+            sd.play(data, sr)
             sd.wait()
+            os.unlink(tmp.name)
         except Exception as e:
+            import traceback
             print(f"[TTS] Error: {e}")
+            traceback.print_exc()
 
 
 # ── Pipeline ─────────────────────────────────────────────────────────────
