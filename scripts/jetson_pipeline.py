@@ -227,7 +227,6 @@ class TTS:
             language="ua",
             speaker="v4_ua",
         )
-        self.model.eval()
         print("[TTS] Silero v4_ua loaded")
 
     def speak(self, text):
