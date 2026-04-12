@@ -244,6 +244,66 @@ The evaluation script will be written in the same style as the Gemini 2.5 Pro te
 
 This section is the living log of the project. Each day we add a dated entry describing what was done, what was learned, and what comes next. The most recent entry sits at the top; older entries accumulate below. At the end of the project this changelog will be flattened into a chronological narrative for the final write-up.
 
+\subsection*{Day 7 --- 2026-04-11/12 (Friday/Saturday): Jetson Orin Nano Super stand-up}
+
+\textbf{Summary.} Brought up the NVIDIA Jetson Orin Nano Super Developer Kit as the third deployment target --- a GPU-accelerated edge device (8~GB shared LPDDR5, 1024 CUDA cores, Ampere SM87, 67 INT8 TOPS). Completed hardware assembly, JetPack 6.2 flash with intermediate firmware updates, and SSH access from the development laptop.
+
+\textbf{What was done.}
+
+\textit{Hardware setup and JetPack installation.}
+\begin{itemize}
+\item Followed the official Jetson AI Lab initial setup guide. Checked firmware version via UEFI menu (Esc at boot splash), performed the intermediate JetPack 5.1.3 firmware update (Steps 2--5: boot JP 5.1.3 SD card, reboot for firmware 5.0, install \texttt{nvidia-l4t-jetson-orin-nano-qspi-updater}, reboot for QSPI update to 36.4.0), then booted JetPack 6.2 from a freshly flashed SD card and completed oem-config. Final firmware version 36.4.3 after a third reboot. Enabled MAXN SUPER power mode (25W).
+\item Key hardware note: the Jetson carrier board has \textbf{no HDMI port} --- DisplayPort only, requiring a DP-to-HDMI adapter for initial setup.
+\end{itemize}
+
+\textit{SSH and network connectivity.}
+\begin{itemize}
+\item USB-C networking (the \texttt{l4tbr0} interface at \texttt{192.168.55.1}) was unstable --- connections established but dropped within seconds with ``client\_loop: send disconnect: Connection reset.'' Not an OOM issue (4.5~GB available). Root cause appears to be USB gadget mode link instability.
+\item Enterprise Wi-Fi (MIT SECURE, WPA2 802.1X/PEAP) was not attempted beyond initial \texttt{nmcli} configuration due to time constraints.
+\item \textbf{Working solution: phone hotspot.} Both the Jetson and laptop joined the same mobile hotspot. Wi-Fi interface on the Jetson is \texttt{wlP1p1s0} (non-standard name, normal for Jetson). Connected via \texttt{sudo nmcli device wifi connect <SSID> password <PASS>}. IP retrieved via \texttt{nmcli device show wlP1p1s0 | grep IP4} (note: \texttt{ip addr show} did not display the IP immediately after connection). SSH established at \texttt{ssh -p 22 kevin@172.20.10.5}. VS Code Remote SSH also confirmed working with explicit \texttt{Port 22} in SSH config.
+\item Documented all connectivity methods and pitfalls in \texttt{SETUP.md} Section~3.4.
+\end{itemize}
+
+\textit{System state and llama.cpp build.}
+\begin{itemize}
+\item Confirmed JetPack version: R36 revision 4.7, CUDA 12.6.68 (\texttt{nvcc --version}). Ubuntu 22.04 (Jammy) on aarch64.
+\item System has 7.4~GB total RAM, $\sim$5.0~GB available at idle with the desktop running. ZRAM swap active (6$\times$635~MB). No NVMe SSD installed --- running entirely from the 231~GB microSD card.
+\item Encountered \texttt{dpkg} interrupted state and unmet \texttt{nvidia-l4t-tools} dependencies from the firmware update process. Fixed with \texttt{sudo dpkg --configure -a} and \texttt{sudo apt --fix-broken install}.
+\item Installed build prerequisites: \texttt{cmake} (3.22.1), \texttt{git}, \texttt{python3-pip}, \texttt{nano}.
+\item Cloned \texttt{ggml-org/llama.cpp} and configured cmake with CUDA backend: \texttt{-DGGML\_CUDA=ON -DGGML\_CUDA\_F16=ON -DGGML\_CUDA\_FA\_ALL\_QUANTS=ON -DCMAKE\_CUDA\_ARCHITECTURES="87"}. The ``87'' targets the Orin Nano's Ampere GPU (compute capability 8.7). Build detected: CUDAToolkit 12.6.68, ARM CPU backend with Cortex-A78AE flags, OpenMP 4.5. NCCL not found (irrelevant --- single GPU). OpenSSL not found (HTTPS disabled, not needed for local inference).
+\item Build completed successfully (llama.cpp version 8763). Using \texttt{-j4} instead of \texttt{-j6} to avoid OOM during CUDA kernel compilation on 8~GB shared memory.
+\item Downloaded \texttt{gemma-4-e4b-it-Q4\_K\_M.gguf} (5.34~GB) via \texttt{huggingface-hub}. Note: the GGUF filenames use lowercase \texttt{e4b}, not uppercase \texttt{E4B} as in the repo name --- the \texttt{--include} filter is case-sensitive and silently downloads 0 bytes if the case is wrong.
+\end{itemize}
+
+\textit{Inference attempt --- blocked by JetPack r36.4.7 CUDA memory bug.}
+\begin{itemize}
+\item GPU detected correctly: ``Orin, compute capability 8.7, VMM: yes, VRAM: 7619 MiB.'' However, \texttt{cudaMalloc} fails with out-of-memory when allocating 2868~MiB for model layers, even with 5.1~GB free system memory (after \texttt{echo 3 > /proc/sys/vm/drop\_caches}).
+\item Partial GPU offload (\texttt{-ngl 20}) also crashes with a different error: \texttt{GGML\_ASSERT(n\_inputs < GGML\_SCHED\_MAX\_SPLIT\_INPUTS)} --- the CPU/GPU split path hits an assertion in the scheduler.
+\item Root cause: \textbf{known bug in JetPack r36.4.7} (confirmed by NVIDIA staff on developer forums). The CUDA memory allocator misreports or mismanages available memory on the unified memory architecture. Fix is in JetPack 6.2.2 (r36.5).
+\item Set system to headless mode (\texttt{systemctl set-default multi-user.target}) to free $\sim$800~MB RAM from the GUI. Pending retest after headless reboot; if still fails, JetPack reflash to r36.5 is required.
+\end{itemize}
+
+\textbf{What was learned.}
+\begin{itemize}
+\item \textbf{USB-C device mode networking is unreliable on the Jetson Orin Nano.} Despite the interface (\texttt{l4tbr0}) being up and pingable, SSH sessions die within seconds. A shared Wi-Fi network (even a phone hotspot) is far more stable. Document this prominently for anyone reproducing the setup.
+\item \textbf{The firmware update gauntlet is the biggest friction point.} A brand-new kit cannot boot JetPack 6.x without first going through JetPack 5.1.3 for firmware updates. This requires two SD card images and three reboot cycles. Pre-flashing two SD cards in advance saves significant time.
+\item \textbf{VS Code Remote SSH requires explicit Port 22.} Without it, connection attempts fail silently or timeout.
+\item \textbf{No NVMe SSD --- not a blocker for inference.} Model loads from disk into shared memory once at startup; after that, inference runs entirely from RAM/GPU. NVMe would help with swap performance and build times, but the 231~GB SD card has sufficient space. Q4\_K\_M (5.34~GB model) plus $\sim$1.5~GB for OS/headless leaves $\sim$1~GB for KV cache --- tight but feasible at \texttt{-c 2048}.
+\item \textbf{Q4\_K\_M is the right quant for Jetson, not Q3\_K\_M.} On the laptop (6~GB discrete VRAM), Q3\_K\_M was required to fit in the VRAM budget. The Jetson's 8~GB shared pool is larger, so Q4\_K\_M (5.34~GB) fits with headroom --- better quality per token for the same model.
+\item \textbf{Package dependency breakage after firmware updates is expected.} The intermediate JetPack 5.1.3 $\rightarrow$ 6.2 firmware dance leaves \texttt{nvidia-l4t-*} packages in a conflicting state. Running \texttt{dpkg --configure -a} and \texttt{apt --fix-broken install} before any other package installs is effectively mandatory.
+\item \textbf{JetPack r36.4.7 has a known CUDA memory allocation bug.} \texttt{cudaMalloc} fails even when sufficient memory is available. NVIDIA confirmed the fix in r36.5 (JetPack 6.2.2). This is a blocking issue for any model that requires $>$2.8~GB GPU allocation.
+\item \textbf{HuggingFace GGUF filenames are lowercase.} The repo is \texttt{ggml-org/gemma-4-E4B-it-GGUF} (uppercase) but the files inside are \texttt{gemma-4-e4b-it-Q4\_K\_M.gguf} (lowercase). The \texttt{--include} filter silently matches nothing and reports ``Download complete: 0.00B'' if the case is wrong.
+\end{itemize}
+
+\textbf{What comes next (Day 8).}
+\begin{itemize}
+\item Reboot headless and retest inference. If \texttt{cudaMalloc} still fails, reflash the SD card with JetPack 6.2.2 (r36.5) --- the confirmed fix for the memory allocation bug.
+\item Once inference works: benchmark tok/s, test with the Ukrainian system prompt via \texttt{-f} file.
+\item Adapt \texttt{scripts/pipeline.py} for Jetson: replace faster-whisper with whisper.cpp (CUDA), update paths from Windows to Linux, replace Piper with Silero V5 Ukrainian TTS.
+\item If inference confirms $\sim$20--35 tok/s, this becomes the primary demo device for the hackathon.
+\item Consider purchasing an NVMe SSD (M.2 2280) for swap and faster model loading if memory pressure becomes an issue during the full voice pipeline (LLM + ASR + TTS simultaneously).
+\end{itemize}
+
 \subsection*{Day 6 --- 2026-04-09 (Wednesday): SFT abandoned, GRPO pivot, system prompt overhaul}
 
 \textbf{Summary.} After five failed SFT runs (v1--v5), the project pivots from supervised fine-tuning to Group Relative Policy Optimization (GRPO). Analysis showed the base Gemma~4 E4B already handles most emergency medical scenarios correctly; SFT degrades performance by overwriting good behavior to match 266 training examples. GRPO's reward-based approach reinforces desired behaviors (no refusals, clinical accuracy, MARCH ordering, concise format) without overwriting existing capabilities. A new GRPO training pipeline was built with four reward functions, including an LLM-as-judge via Gemini 2.5 Flash for clinical correctness scoring.

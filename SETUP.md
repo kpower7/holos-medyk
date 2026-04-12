@@ -5,8 +5,9 @@ Step-by-step setup instructions for all four platforms: Windows laptop (developm
 **Table of contents**
 - [1. Windows Laptop (Developer Workstation)](#1-windows-laptop-developer-workstation)
 - [2. Raspberry Pi 5 (Standalone Device)](#2-raspberry-pi-5-standalone-device)
-- [3. Android Phone](#3-android-phone)
-- [4. iOS / iPhone](#4-ios--iphone)
+- [3. Jetson Orin Nano Super (Edge GPU Device)](#3-jetson-orin-nano-super-edge-gpu-device)
+- [4. Android Phone](#4-android-phone)
+- [5. iOS / iPhone](#5-ios--iphone)
 
 ---
 
@@ -381,7 +382,257 @@ This is too slow for a product. The obvious next levers are (a) enabling the Lit
 
 ---
 
-## 3. Android Phone
+## 3. Jetson Orin Nano Super (Edge GPU Device)
+
+GPU-accelerated edge device for fast local inference. The Jetson Orin Nano Super has 8 GB shared CPU/GPU memory, 1024 CUDA cores (Ampere SM87), and 67 INT8 TOPS. Unlike the Pi 5, it can run Gemma 4 E4B at interactive speeds (~20-35 tok/s).
+
+### 3.1 Hardware you need
+
+**In the box:** Jetson Orin Nano 8GB module + carrier board with heatsink, 19V DC power supply, Wi-Fi/BT module (pre-installed).
+
+**You must supply:**
+- **microSD card** (128 GB, UHS-I or faster). Two cards recommended to avoid re-flashing between firmware steps.
+- **DisplayPort cable or active DP-to-HDMI adapter.** The board has NO HDMI port.
+- **USB keyboard + mouse** (for first boot only).
+- **Display** with DisplayPort or HDMI (via adapter).
+- **NVMe SSD, M.2 2280** (256 GB+). Samsung 990 EVO, Crucial P3, WD SN770 all tested. SD card is too slow for model loading and swap — NVMe is effectively required.
+- **5V PWM fan** (optional but recommended — passive heatsink throttles under sustained inference).
+- **USB audio adapter** (for voice pipeline — board has no audio jack).
+
+### 3.2 Flash firmware and JetPack
+
+The kit ships with old firmware that cannot boot JetPack 6.x directly. Follow the official guide at https://www.jetson-ai-lab.com/tutorials/initial-setup-jetson-orin-nano/
+
+**Step 1: Check firmware version.** Connect display + keyboard, plug in 19V power (powers on immediately, no button). Press **Esc** repeatedly at the NVIDIA splash screen. Read the third line — that's your firmware version. If >= 36.0, skip to Step 6.
+
+**Steps 2–5: Firmware update (only if firmware < 36.0).**
+1. Download `JP513-orin-nano-sd-card-image_b29.zip` from the JetPack 5.1.3 page. Flash to microSD with Balena Etcher. Insert, power on, complete oem-config.
+2. `sudo reboot` — firmware updates to version 5.0.
+3. Verify: `sudo nvbootctrl dump-slots-info` (should show 35.5.0). Then: `sudo apt-get install nvidia-l4t-jetson-orin-nano-qspi-updater`
+4. `sudo reboot` — QSPI updates. System will get stuck. **Power off and remove the card.**
+
+**Step 6: Boot JetPack 6.2.** Download `jp62-r1-orin-nano-sd-card-image.zip`. Flash to microSD. Insert, power on, complete oem-config (language, timezone, Wi-Fi, user account). Verify: `sudo systemctl status nv-l4t-bootloader-config`
+
+**Step 7:** `sudo reboot` — firmware finalizes to 36.4.3.
+
+**Step 8: Enable MAXN SUPER.** Click NVIDIA icon in top bar → Power mode → MAXN SUPER.
+
+### 3.3 Post-boot configuration
+
+```bash
+# Essential tools
+sudo apt-get update && sudo apt-get upgrade -y
+sudo apt-get install -y python3-pip git cmake nano openssh-server
+
+# Enable SSH
+sudo systemctl enable ssh && sudo systemctl start ssh
+
+# Install jtop (Jetson system monitor)
+sudo pip3 install jetson-stats
+sudo systemctl restart jtop
+
+# Set max performance
+sudo nvpmodel -m 0
+sudo jetson_clocks
+```
+
+### 3.4 SSH access
+
+**From another machine on the same network:**
+```bash
+ssh -p 22 kevin@<jetson-ip>
+```
+
+Find the Jetson's IP: `nmcli device show wlP1p1s0 | grep IP4` (the `IP4.ADDRESS` line).
+
+**Recommended: Phone hotspot.** Both the Jetson and your laptop join the same phone hotspot. This is the most reliable method — avoids enterprise Wi-Fi headaches and USB-C link instability.
+
+```bash
+# On the Jetson, connect to hotspot
+sudo nmcli device wifi connect HOTSPOT_NAME password HOTSPOT_PASSWORD
+
+# Get the IP
+nmcli device show wlP1p1s0 | grep IP4
+
+# From your laptop (also on the hotspot)
+ssh -p 22 kevin@<jetson-ip>
+```
+
+**VS Code Remote SSH:** Add to `~/.ssh/config` (on Windows: `C:\Users\<you>\.ssh\config`):
+```
+Host jetson
+    HostName <jetson-ip>
+    User kevin
+    Port 22
+```
+Then `Ctrl+Shift+P` → "Remote-SSH: Connect to Host" → `jetson`.
+
+**USB-C (unreliable — not recommended).** The Jetson exposes `192.168.55.1` on the `l4tbr0` interface, but the link drops frequently with "Connection reset" errors. Only use as a last resort.
+
+**Enterprise Wi-Fi (WPA2 802.1X, e.g. MIT SECURE):**
+```bash
+sudo nmcli connection add type wifi \
+  con-name "MIT-SECURE" \
+  ifname wlP1p1s0 \
+  ssid "MIT SECURE" \
+  wifi-sec.key-mgmt wpa-eap \
+  802-1x.eap peap \
+  802-1x.phase2-auth mschapv2 \
+  802-1x.identity "YOUR_USERNAME" \
+  802-1x.password "YOUR_PASSWORD"
+sudo nmcli connection up "MIT-SECURE"
+```
+
+**Note:** The Wi-Fi interface is `wlP1p1s0` (non-standard name, normal for Jetson). Check with `nmcli device status`. `ip addr show wlP1p1s0` may not show the IP immediately after connecting — use `nmcli device show wlP1p1s0 | grep IP4` instead.
+
+### 3.5 NVMe SSD setup and swap
+
+```bash
+# Check the SSD is detected
+lsblk
+
+# Format (assuming /dev/nvme0n1p1 — adjust if different)
+sudo mkfs.ext4 /dev/nvme0n1p1
+sudo mkdir -p /ssd
+sudo mount /dev/nvme0n1p1 /ssd
+echo '/dev/nvme0n1p1 /ssd ext4 defaults 0 2' | sudo tee -a /etc/fstab
+
+# 16 GB swap on NVMe (critical — 8 GB shared memory is tight with a 5.3 GB model)
+sudo fallocate -l 16G /ssd/16GB.swap
+sudo chmod 600 /ssd/16GB.swap
+sudo mkswap /ssd/16GB.swap
+sudo swapon /ssd/16GB.swap
+echo '/ssd/16GB.swap none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# Disable ZRAM (conflicts with NVMe swap under memory pressure)
+sudo systemctl disable nvzramconfig
+```
+
+### 3.6 Free RAM by going headless
+
+Once SSH is working, disable the desktop to free ~800 MB — critical when the model is 5.3 GB out of 8 GB total:
+
+```bash
+sudo systemctl set-default multi-user.target
+sudo reboot
+```
+
+Reconnect via SSH after reboot. The Jetson will boot to a text console (no desktop).
+
+**To restore the GUI:**
+```bash
+sudo systemctl set-default graphical.target && sudo reboot
+```
+
+**After rebooting headless**, you must reconnect Wi-Fi from the text console before SSH works:
+```bash
+sudo nmcli device wifi connect HOTSPOT_NAME password HOTSPOT_PASSWORD
+nmcli device show wlP1p1s0 | grep IP4
+```
+
+### 3.7 Build llama.cpp with CUDA
+
+```bash
+export PATH=/usr/local/cuda/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+
+cd /ssd
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+
+cmake -B build \
+  -DGGML_CUDA=ON \
+  -DGGML_CUDA_F16=ON \
+  -DLLAMA_CURL=ON \
+  -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="87"
+
+cmake --build build --config Release -j4
+```
+
+Use `-j4` not `-j6` — higher parallelism can OOM during CUDA kernel compilation on 8 GB.
+
+**Critical flag:** `-DCMAKE_CUDA_ARCHITECTURES="87"` targets the Orin's Ampere GPU (compute capability 8.7). Without it, the build may fail or produce a binary that doesn't detect the GPU.
+
+### 3.8 Download models
+
+```bash
+# Install huggingface CLI
+pip3 install huggingface-hub
+hf auth login
+
+# Download Gemma 4 E4B Q4_K_M (5.34 GB — the only quant that fits)
+hf download ggml-org/gemma-4-E4B-it-GGUF \
+  --include "gemma-4-E4B-it-Q4_K_M.gguf" \
+  --local-dir /ssd/models/
+```
+
+**Note:** On the 6 GB laptop we use Q3_K_M to fit in discrete VRAM. On the Jetson we can use **Q4_K_M** (5.34 GB) because the shared memory pool is 8 GB and we've freed headroom by going headless.
+
+### 3.9 Test inference
+
+```bash
+/ssd/llama.cpp/build/bin/llama-cli \
+  -m /ssd/models/gemma-4-E4B-it-Q4_K_M.gguf \
+  -ngl 99 \
+  -c 2048 \
+  -n 256 \
+  --single-turn \
+  -p "You are Holos Medyk. A civilian says: my daughter is bleeding from her arm. What do I do? Respond in Ukrainian."
+```
+
+Should see the GPU detected as `Orin, compute capability 8.7` and get a response at ~20-35 tok/s.
+
+### 3.10 Voice pipeline on Jetson
+
+The desktop pipeline (`scripts/pipeline.py`) is the right base — it uses llama.cpp subprocess calls. For Jetson, the key adaptations are:
+
+- **ASR:** whisper.cpp with CUDA replaces faster-whisper (faster-whisper is painful to build on ARM64). Build whisper.cpp the same way as llama.cpp with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="87"`.
+- **TTS:** Silero V5 Ukrainian voices (`ukr_kateryna`, `ukr_mykyta`, etc.) via PyTorch. Install the NVIDIA Jetson PyTorch wheel. Fallback: Piper TTS via jetson-containers.
+- **Audio I/O:** USB audio adapter required (no onboard audio jack). PulseAudio (default on JetPack 6) — do NOT use PipeWire (broken on Jetson).
+- **Bluetooth audio:** Requires editing `/lib/systemd/system/bluetooth.service.d/nv-bluetooth-service.conf` to remove `--noplugin=audio,a2dp,avrcp`, plus `sudo apt-get install pulseaudio-module-bluetooth`.
+
+### 3.11 Key flags for llama.cpp on Jetson
+
+| Flag | Why |
+|---|---|
+| `-ngl 99` | Full GPU offload. Same as laptop — partial offload triggers bugs. |
+| `-c 2048` | Context window. Keep low to conserve shared memory for KV cache. |
+| `-DCMAKE_CUDA_ARCHITECTURES="87"` | Build flag for Orin Nano's Ampere GPU. |
+
+### 3.12 Expected performance
+
+| Model | Quant | File Size | Expected Speed |
+|---|---|---|---|
+| Gemma 4 E4B | Q4_K_M | 5.34 GB | ~20-35 tok/s |
+
+Compare: Pi 5 takes ~2 min per response (CPU only). Jetson should produce a full response in 5-15 seconds.
+
+### 3.13 Restoring the Jetson to normal desktop use
+
+When you're done with the Holos Medyk project and want the Jetson back as a normal desktop machine:
+
+```bash
+sudo systemctl set-default graphical.target
+sudo reboot
+```
+
+This restores the Ubuntu GUI on boot. **Do this before shelving the device** — otherwise the next time you power it on you'll get a text console with no obvious way to get the desktop back.
+
+### 3.14 Common pitfalls on Jetson
+
+- **Black screen on first boot with JetPack 6.2 SD card.** Firmware is too old. You must go through the JetPack 5.1.3 intermediate update first. See Step 2–5 above.
+- **No HDMI port.** DisplayPort only. Use a DP-to-HDMI adapter (active recommended).
+- **`cudaMalloc failed: out of memory` even with memory available.** Known bug in JetPack r36.4.7. Update to JetPack 6.2.2 (r36.5) or later.
+- **llama.cpp build fails with CUDA errors.** Ensure `DCMAKE_CUDA_ARCHITECTURES="87"` is set. Ensure CUDA paths are exported.
+- **Wi-Fi interface named `wlP1p1s0` not `wlan0`.** Normal for Jetson. Use `nmcli device status` to find interfaces.
+- **SSH connection timeout via USB-C.** Specify port explicitly: `ssh -p 22 kevin@192.168.55.1`.
+- **Thermal throttling under load.** The passive heatsink is insufficient for sustained inference. Add a 5V fan to the 4-pin fan header.
+- **Q8_0 model (8.03 GB) won't load.** Exceeds the 8 GB shared memory pool. Use Q4_K_M only.
+
+---
+
+## 4. Android Phone
 
 Fresh phone setup for installing and running the Flutter app.
 
@@ -506,7 +757,7 @@ Then hot-restart (`R`) or rebuild (`flutter run`).
 
 ---
 
-## 4. iOS / iPhone
+## 5. iOS / iPhone
 
 iOS builds require a **Mac**. There is no supported way to build an iOS app from Windows or Linux — Apple's code signing, provisioning, and the iOS Simulator all require macOS and Xcode. The options below assume you either have access to a Mac or are willing to use a cloud Mac service for the duration of the build.
 
@@ -656,7 +907,8 @@ For this project, a MacinCloud monthly subscription around the hackathon submiss
 |---|---|---|---|
 | Windows laptop | llama.cpp (prebuilt CUDA binary) | GGUF (Q3_K_M for E4B) | LiteRT-LM has no Windows build; llama.cpp is the closest equivalent |
 | Raspberry Pi 5 | LiteRT-LM (Python API) | `.litertlm` | Official runtime with native audio input support |
+| Jetson Orin Nano | llama.cpp (built from source with CUDA) | GGUF (Q4_K_M for E4B) | LiteRT-LM has no CUDA/Jetson support; llama.cpp with CUDA gives ~20-35 tok/s |
 | Android | LiteRT-LM via `flutter_gemma` plugin | `.litertlm` | Plugin wraps LiteRT-LM for Flutter, supports both GPU and NPU backends |
 | iOS | LiteRT-LM via `flutter_gemma` plugin | `.litertlm` | Same plugin, uses Metal GPU acceleration on-device |
 
-All four platforms run the **same** Gemma 4 E4B weights. The only thing that differs is the runtime wrapper and quantization format.
+All five platforms run the **same** Gemma 4 E4B weights. The only thing that differs is the runtime wrapper and quantization format.
