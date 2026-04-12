@@ -193,7 +193,6 @@ class LLM:
         try:
             resp = urlopen(req, timeout=120)
             full_text = ""
-            thinking = True  # Skip thinking tokens at the start
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
                 if not line.startswith("data: "):
@@ -204,27 +203,15 @@ class LLM:
                 try:
                     chunk = json.loads(data)
                     delta = chunk["choices"][0]["delta"]
-                    token = delta.get("content", "")
-                    if not token:
-                        continue
-                    # Detect end of thinking
-                    if thinking:
-                        full_text += token
-                        if "[End thinking]" in full_text or "<end_of_thought>" in full_text:
-                            thinking = False
-                            # Strip everything up to and including the marker
-                            for marker in ["[End thinking]", "<end_of_thought>"]:
-                                if marker in full_text:
-                                    full_text = full_text.split(marker)[-1]
-                            sys.stdout.write(full_text)
-                            sys.stdout.flush()
+                    token = delta.get("content")
+                    if token is None:
                         continue
                     full_text += token
                     sys.stdout.write(token)
                     sys.stdout.flush()
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
-            print()  # Newline after streaming
+            print()
             return full_text.strip()
         except Exception as e:
             import traceback
