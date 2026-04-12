@@ -344,6 +344,21 @@ This section is the living log of the project. Each day we add a dated entry des
 \item \textbf{Result: success.} GPU detected correctly (``Orin, compute capability 8.7, VMM: yes, VRAM: 7607 MiB''). Model loaded, \texttt{cudaMalloc} succeeded. Generated a coherent response.
 \item \textbf{Performance: 10.4~t/s prompt processing, 12.1~t/s generation.} This is slower than the estimated 20--35~t/s from the Day~7 SETUP.md, but the model is generating at interactive speed --- a full 128-token response completes in $\sim$10 seconds. Likely improvable with \texttt{-fa} (flash attention) and \texttt{jetson\_clocks}.
 \item Compared to other platforms: the Pi~5 takes $\sim$2 minutes per response (CPU only). The Jetson produces a response in $\sim$10 seconds. The Windows laptop (RTX A1000 6GB, Q3\_K\_M) generates at $\sim$30~t/s but uses a lower quantization.
+\item Tested with the medical system prompt in interactive chat mode. The base model with the improved system prompt produced clinically correct hemorrhage guidance (``STOP THE BLEEDING. NOW. 1. PRESSURE... 2. HIGH... 3. BANDAGE... 4. TOURNIQUET...'') following MARCH order, with no refusals or disclaimers.
+\end{itemize}
+
+\textit{GUI restore and Bluetooth audio.}
+\begin{itemize}
+\item Restored the desktop GUI (\texttt{sudo systemctl set-default graphical.target}) since the 800~MB memory savings from headless mode is no longer needed --- r36.5 fixed the cudaMalloc bug and the model fits with $\sim$1.7~GB headroom even with the desktop running.
+\item Bluetooth headset (Sony WH-CH720N) pairing required multiple fixes:
+  \begin{enumerate}
+  \item \texttt{bluetoothctl connect} failed with \texttt{br-connection-profile-unavailable} --- fixed by \texttt{sudo apt install pulseaudio-module-bluetooth} and PulseAudio restart.
+  \item Headset connected at link level but no audio device appeared in GUI sound panel --- fixed by activating the audio profile: \texttt{pacmd set-card-profile bluez\_card.88\_92\_CC\_C1\_19\_2E handsfree\_head\_unit}.
+  \item \texttt{parecord}, \texttt{paplay}, and Python \texttt{sounddevice} all failed with ``Connection refused'' from SSH --- PulseAudio does not accept connections from SSH child processes by default. Tools like \texttt{pacmd} work because they use a direct socket, but all recording/playback tools use the standard client protocol which is blocked.
+  \item \textbf{Fix: enable PulseAudio TCP access.} \texttt{pacmd load-module module-native-protocol-tcp auth-anonymous=1} allows localhost connections. Then \texttt{export PULSE\_SERVER=tcp:127.0.0.1} before any audio command from SSH. This is required for the voice pipeline to work over SSH.
+  \end{enumerate}
+\item Verified end-to-end Bluetooth audio: recorded 3 seconds from headset mic via \texttt{parecord}, played back through headset speaker via \texttt{paplay}. Audio quality confirmed usable for voice assistant input.
+\item Documented full Bluetooth setup, PulseAudio SSH workaround, and troubleshooting in \texttt{SETUP.md} Section~3.13.
 \end{itemize}
 
 \textbf{What was learned.}
@@ -351,16 +366,33 @@ This section is the living log of the project. Each day we add a dated entry des
 \item \textbf{JetPack r36.4.7 NvMap bug is real and the APT upgrade to r36.5 fixes it cleanly.} No reflash needed. The upgrade took $\sim$15 minutes plus a reboot. The interrupted \texttt{apt dist-upgrade} was recoverable with \texttt{dpkg --configure -a}.
 \item \textbf{Home Wi-Fi router AP isolation blocks device-to-device communication.} Both devices on the same subnet, both online, but the router prevents them from seeing each other. Phone hotspot remains the reliable workaround. A permanent fix requires disabling AP isolation in router settings.
 \item \textbf{Headless Jetson does not auto-reconnect to Wi-Fi after reboot.} This is a significant operational annoyance --- after every reboot you need physical keyboard access (or a pre-configured \texttt{nmcli connection} with \texttt{autoconnect yes}) to re-establish the SSH path.
-\item \textbf{12.1 tok/s is usable for a voice assistant.} A typical 200--400 character response ($\sim$50--100 tokens) takes 4--8 seconds. Combined with TTS latency, total response time should be $\sim$6--12 seconds --- not instant, but acceptable for a warzone scenario where the user is actively performing first aid and waiting for the next instruction.
+\item \textbf{12.1 tok/s is usable for a voice assistant.} A typical 200--400 character response ($\sim$50--100 tokens) takes 4--8 seconds. Human speech is $\sim$150 words/min ($\sim$3 tok/s), so the model generates 4$\times$ faster than someone can listen. TTS playback is the real bottleneck, not generation speed.
+\item \textbf{Headless mode unnecessary after r36.5.} The 800~MB savings from disabling the GUI was a workaround for the cudaMalloc bug. With r36.5, the model (5.34~GB) + KV cache ($\sim$0.5~GB at \texttt{-c 2048}) fits with $\sim$1.7~GB to spare even with the desktop running. Keep the GUI for easier Bluetooth management and debugging.
+\item \textbf{JetPack's PulseAudio lacks Bluetooth audio out of the box.} \texttt{pulseaudio-module-bluetooth} is not pre-installed. Without it, \texttt{bluetoothctl connect} succeeds at the link level but fails with \texttt{br-connection-profile-unavailable} because no A2DP/HFP profile handler exists. One \texttt{apt install} fixes it.
+\end{itemize}
+
+\textit{Jetson voice pipeline.}
+\begin{itemize}
+\item Created \texttt{scripts/jetson\_pipeline.py}: full voice loop adapted from the Windows pipeline for the Jetson. Architecture: Silero VAD (speech detection) $\rightarrow$ faster-whisper tiny (Ukrainian ASR on CPU) $\rightarrow$ llama.cpp (Gemma~4 E4B via CUDA subprocess) $\rightarrow$ Silero v4\_ua (Ukrainian TTS) $\rightarrow$ Bluetooth speaker.
+\item Set up Python venv (\texttt{\~{}/holos-env}) with: \texttt{numpy}, \texttt{sounddevice}, \texttt{soundfile}, \texttt{faster-whisper}, \texttt{silero-vad}. Required \texttt{python3.10-venv} and \texttt{libportaudio2} apt packages.
+\item Tested LLM in text-only mode: model produced clinically correct hemorrhage response (``DO NOT pull the glass out... Press down hard on the wound... tourniquet...'') with thinking trace. 13.4~t/s generation.
+\item Identified cold-start problem: \texttt{--single-turn} mode reloads the 5.34~GB model for every prompt ($\sim$70s loading overhead on each call). Created a second pipeline variant (\texttt{jetson\_pipeline\_server.py}) that calls \texttt{llama-server} HTTP API instead --- model stays resident in GPU memory, first token in $<$1s after warmup.
+\item Response parsing proved fragile: the model's output format varies (sometimes thinking blocks, sometimes not, different markers). The server-based pipeline eliminates this entirely --- \texttt{/v1/chat/completions} returns clean JSON with just the response text.
+\end{itemize}
+
+\textit{Design exploration: beacon mode.}
+\begin{itemize}
+\item Brainstormed an alternative deployment model: instead of a standalone voice-in/voice-out device, the Jetson (or more powerful hardware) acts as a \textbf{local inference beacon} that multiple users dial into during an emergency. Phones connect via local Wi-Fi or Bluetooth to the beacon's HTTP API. No internet required --- the beacon creates its own network.
+\item The \texttt{llama-server} already supports this architecture: it's an HTTP API that multiple concurrent clients can call. A phone with a simple web app or native client could record audio locally, send it to the beacon for ASR + LLM processing, and play back the TTS response.
+\item Hardware requirements: concurrent multi-user inference would need more VRAM than the Jetson Orin Nano's 8~GB shared pool (which can handle only one inference at a time). A Jetson AGX Orin (32--64~GB) or a mini PC with a discrete GPU would be needed. This is a future direction, not the hackathon scope.
 \end{itemize}
 
 \textbf{What comes next (Day 9).}
 \begin{itemize}
-\item Test with the full Ukrainian medical system prompt via \texttt{-f} file to confirm multilingual generation quality and response structure.
-\item Optimize Jetson inference: enable flash attention (\texttt{-fa}), run \texttt{sudo jetson\_clocks} to maximize GPU clock, test with \texttt{-c 1024} (smaller context) to free memory for KV cache.
+\item Start \texttt{llama-server} on Jetson and test the server-based pipeline end-to-end with Bluetooth audio (mic $\rightarrow$ ASR $\rightarrow$ LLM $\rightarrow$ TTS $\rightarrow$ speaker).
+\item Install Silero TTS v4\_ua in the Jetson venv and verify Ukrainian speech output quality.
 \item Test the GRPO Colab notebook (\texttt{training/holos\_medyk\_grpo\_colab.ipynb}) --- the training pipeline is ready but untested.
-\item Set up auto-reconnect for the Jetson Wi-Fi to survive reboots: \texttt{nmcli connection modify <conn> connection.autoconnect yes}.
-\item Begin adapting the voice pipeline for Jetson: ASR (whisper.cpp with CUDA or Gemma~4 native audio), TTS (Silero V5 Ukrainian), audio I/O (USB adapter + PulseAudio).
+\item Set up auto-reconnect for the Jetson Wi-Fi: \texttt{nmcli connection modify <conn> connection.autoconnect yes}.
 \end{itemize}
 
 \subsection*{Day 6 --- 2026-04-09 (Wednesday): SFT abandoned, GRPO pivot, system prompt overhaul}

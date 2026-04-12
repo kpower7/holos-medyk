@@ -608,7 +608,80 @@ The desktop pipeline (`scripts/pipeline.py`) is the right base — it uses llama
 
 Compare: Pi 5 takes ~2 min per response (CPU only). Jetson should produce a full response in 5-15 seconds.
 
-### 3.13 Restoring the Jetson to normal desktop use
+### 3.13 Bluetooth audio (headset mic + speaker)
+
+The Jetson Orin Nano has built-in Bluetooth but needs extra setup for audio profiles.
+
+**One-time setup:**
+
+```bash
+sudo apt install pulseaudio-module-bluetooth libasound2-plugins libportaudio2 -y
+pulseaudio -k && pulseaudio --start
+```
+
+**Pairing a headset (e.g. Sony WH-CH720N):**
+
+1. Put the headset in pairing mode (hold power button ~7 seconds until blue light flashes rapidly).
+
+2. Find the device:
+```bash
+bluetoothctl devices | grep -i <partial-name>
+```
+
+3. Connect and trust:
+```bash
+bluetoothctl connect <MAC>
+bluetoothctl trust <MAC>
+```
+
+4. Activate the audio profile (replace the MAC with yours — colons become underscores):
+```bash
+# Find your device's MAC from: bluetoothctl devices
+# e.g. 88:92:CC:C1:19:2E becomes 88_92_CC_C1_19_2E
+pacmd set-card-profile bluez_card.88_92_CC_C1_19_2E handsfree_head_unit
+```
+
+5. Verify it's the default:
+```bash
+pacmd dump | grep default
+```
+Should show `set-default-sink bluez_sink...` and `set-default-source bluez_source...`.
+
+**Using audio from SSH sessions (critical):**
+
+PulseAudio runs per-user and does NOT accept connections from SSH sessions by default. `parecord`, `paplay`, `pactl`, and Python `sounddevice` all fail with "Connection refused" from SSH. The fix:
+
+```bash
+# Enable TCP access (run once per PulseAudio session):
+pacmd load-module module-native-protocol-tcp auth-anonymous=1
+
+# Then all audio commands from SSH must use:
+export PULSE_SERVER=tcp:127.0.0.1
+```
+
+After this, `parecord`, `paplay`, and Python scripts using `sounddevice` will work from SSH.
+
+**Note:** `pacmd` uses a different connection method (direct socket) and always works from SSH even without the TCP module. Use `pacmd` for configuration commands, and `PULSE_SERVER=tcp:127.0.0.1` for recording/playback.
+
+**Quick audio test (record 3 seconds, play back):**
+```bash
+export PULSE_SERVER=tcp:127.0.0.1
+parecord /tmp/test_bt.wav &
+sleep 3 && kill $!
+paplay /tmp/test_bt.wav
+```
+
+**Common issues:**
+- **`br-connection-profile-unavailable` on connect:** `pulseaudio-module-bluetooth` not installed. Install it and restart PulseAudio.
+- **Connected but no audio device in GUI sound panel:** Run `pacmd set-card-profile bluez_card.<MAC> handsfree_head_unit` to activate the audio profile.
+- **`Connection refused` from SSH:** PulseAudio doesn't accept SSH connections by default. Load the TCP module: `pacmd load-module module-native-protocol-tcp auth-anonymous=1`, then `export PULSE_SERVER=tcp:127.0.0.1`.
+- **Connects then immediately drops:** Run `bluetoothctl trust <MAC>` so it doesn't require re-auth.
+- **Scan output floods the terminal:** Use `bluetoothctl devices` non-interactively instead of interactive `scan on`. Or run `scan off` inside bluetoothctl before typing other commands.
+- **Headset not appearing in scan:** Make sure it's in pairing mode, not just powered on. Hold power button until you hear "pairing" announcement.
+- **`PortAudio library not found` in Python:** `sudo apt install libportaudio2`.
+- **`sounddevice` doesn't show Bluetooth devices:** Need `libasound2-plugins` for the PulseAudio ALSA plugin, plus `~/.asoundrc` routing to pulse, plus `PULSE_SERVER=tcp:127.0.0.1`.
+
+### 3.14 Restoring the Jetson to normal desktop use
 
 When you're done with the Holos Medyk project and want the Jetson back as a normal desktop machine:
 
