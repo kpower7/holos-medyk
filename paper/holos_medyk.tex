@@ -402,6 +402,62 @@ This section is the living log of the project. Each day we add a dated entry des
 \item Switched to \texttt{robinhad/ukrainian-tts} (the Day~5 TTS comparison winner for Ukrainian quality). Installed via \texttt{pip install git+https://github.com/robinhad/ukrainian-tts.git}. Auto-downloads model weights ($\sim$300~MB), stanza Ukrainian corpus, and NLTK data on first run. Uses the Tetiana voice by default with dictionary-based stress marking.
 \end{itemize}
 
+\textit{TTS optimizations on feature branch (\texttt{jetson-tts-optimizations}).}
+\begin{itemize}
+\item Branched off \texttt{master} to preserve the known-working \texttt{jetson\_pipeline\_server.py} (TTS at end of response) before attempting optimizations. Created \texttt{scripts/jetson\_pipeline\_streaming.py} on the branch.
+\item \textbf{Optimization 1 --- Shorter system prompt:} The original prompt produced 5-paragraph numbered responses with bold headers and markdown. TTS on 103-second English responses is unusable. Rewrote prompt with explicit constraints: ``Give ONE urgent action first, then 2-3 short follow-up steps. Each sentence must be under 15 words. No numbered lists, no headers, no markdown.'' Result: LLM responses dropped from 103~s to 11.8~s for the same Ukrainian prompt.
+\item \textbf{Optimization 2 --- Sentence-chunked TTS:} Rewrote the LLM client as \texttt{stream\_generate(user\_text, sentence\_callback)}. As tokens arrive from the SSE stream, accumulate them in a buffer; when \texttt{SENTENCE\_BOUNDARY = re.compile(r'([.!?]+)(\textbackslash{}s|\$)')} matches, extract the complete sentence and fire \texttt{sentence\_callback(sentence)}. Remainder stays in the buffer for the next match.
+\item The TTS class runs a background worker thread consuming from a \texttt{queue.Queue}. Each sentence is synthesized and played back sequentially via \texttt{sd.play + sd.wait}. This means: tokens stream, sentences complete as they're generated, each sentence enters the TTS queue immediately, and the worker thread synthesizes + plays them in order.
+\item \textbf{Optimization 3 --- Attempted GPU TTS:} The \texttt{ukrainian-tts} package supports \texttt{device="cuda"}. Modified the \texttt{TTS} class to try CUDA first, fall back to CPU gracefully. Result: fell back to CPU with the warning ``NVIDIA driver on your system is too old (found version 12060)'' --- the torch wheel in the venv was installed from the standard PyPI CPU index and has no CUDA kernels for ARM64 + Jetson's Ampere 8.7 compute capability.
+\item To make TTS actually run on GPU, the venv needs NVIDIA's Jetson-specific torch wheel: \texttt{pip install torch torchvision --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126}. This requires numpy==1.26.1 and may break other packages (espnet, faster-whisper). Deferred to Day~9 --- recommend creating a parallel \texttt{\~{}/holos-env-gpu} venv to avoid breaking the working \texttt{\~{}/holos-env}.
+\end{itemize}
+
+\textit{Empirical behavior observed.}
+\begin{itemize}
+\item \textbf{Correction to initial observation:} TTS did NOT start playing during LLM generation. Despite the sentence-streaming implementation, the first audible speech came $\sim$2~seconds \textit{after} LLM generation completed. Investigation needed: likely the sentence callback is enqueuing but the worker thread is blocked on synthesis (RTF = 3.0 on CPU means each sentence takes 3$\times$ its audio duration to synthesize). By the time synthesis of sentence 1 finishes, LLM has finished all sentences.
+\item \textbf{RTF = 3.0 on CPU is the core problem.} The robinhad ESPnet model synthesizes at 3$\times$ slower than real-time on the Jetson's 6 ARM cores. A 60-second response takes $\sim$180~seconds to synthesize. Streaming helps only if synthesis can keep up with generation; at RTF 3.0 it can't.
+\item \textbf{Shorter responses partially solve this.} The new prompt produces $\sim$20-second responses. At RTF 3.0, synthesis takes $\sim$60~s. Still bad, but tractable --- and if we can get GPU TTS working next session (Jetson's ESPnet-on-GPU should achieve RTF $<$1.0), the streaming architecture already in place will deliver true real-time playback.
+\end{itemize}
+
+\textit{Detailed session log.}
+\begin{itemize}
+\item \textbf{Network (new workstation):} Home Wi-Fi at \texttt{192.168.2.98}, same subnet as laptop (also \texttt{192.168.2.x}). Ping ``Destination host unreachable'' despite Jetson having working internet (\texttt{ping 8.8.8.8} succeeded). Diagnosed as router AP isolation. Fell back to phone hotspot: Jetson at \texttt{172.20.10.5}, laptop on same hotspot. \texttt{sudo nmcli device wifi rescan} required before the hotspot appeared in \texttt{nmcli device wifi list}.
+\item \textbf{JetPack upgrade:} \texttt{sed -i 's/r36.4/r36.5/g' /etc/apt/sources.list.d/nvidia-l4t-apt-source.list} (3 lines changed). \texttt{sudo apt update \&\& sudo apt dist-upgrade -y}. Dialog for \texttt{nv-oem-config-post.sh}: answered N. Dialog for \texttt{nvidia-l4t-apt-source.list}: answered N (already edited manually). Process interrupted during ``Processing triggers for libc-bin''; recovered with \texttt{sudo dpkg --configure -a} followed by \texttt{sudo apt --fix-broken install -y}. Reboot. Confirmed: \texttt{cat /etc/nv\_tegra\_release} shows \texttt{R36, REVISION: 5.0, GCID: 43688277, DATE: Fri Jan 16 03:50:45 UTC 2026}.
+\item \textbf{Inference verification:} \texttt{\~{}/llama.cpp/build/bin/llama-cli -m \~{}/models/gemma-4-e4b-it-Q4\_K\_M.gguf -ngl 99 -c 2048 -n 128 -p "Hello, how are you?"}. GPU detected (``Orin, compute capability 8.7, VMM: yes, VRAM: 7607 MiB''). Model loaded successfully after r36.5. Result: coherent response, 10.4~t/s prompt, 12.1~t/s generation.
+\item \textbf{GUI restore:} \texttt{sudo systemctl set-default graphical.target \&\& sudo reboot}. After reboot, desktop returned. No cudaMalloc issues despite GUI consuming $\sim$800~MB.
+\item \textbf{Bluetooth pairing session (Sony WH-CH720N, MAC 88:92:CC:C1:19:2E):}
+  \begin{enumerate}
+  \item \texttt{sudo systemctl status bluetooth} --- service active.
+  \item First \texttt{bluetoothctl connect}: \texttt{Failed to connect: org.bluez.Error.NotAvailable br-connection-profile-unavailable}.
+  \item \texttt{sudo apt install pulseaudio-module-bluetooth -y} + \texttt{pulseaudio -k \&\& pulseaudio --start}.
+  \item Connect succeeded at link level but no audio device in GUI sound panel. \texttt{pacmd set-card-profile bluez\_card.88\_92\_CC\_C1\_19\_2E handsfree\_head\_unit}. Verified with \texttt{pacmd list-sources}: now shows \texttt{bluez\_source.88\_92\_CC\_C1\_19\_2E.handsfree\_head\_unit} as default.
+  \item SSH audio blocked: \texttt{pactl} and \texttt{parecord} returned ``Connection refused'' from SSH despite \texttt{pacmd} working. Fixed with \texttt{pacmd load-module module-native-protocol-tcp auth-anonymous=1} + \texttt{export PULSE\_SERVER=tcp:127.0.0.1}.
+  \item Verified: \texttt{parecord /tmp/test\_bt.wav \& sleep 3 \&\& kill \$!; paplay /tmp/test\_bt.wav} --- heard own voice through headset.
+  \end{enumerate}
+\item \textbf{Python environment (\~{}/holos-env):}
+  \begin{itemize}
+  \item \texttt{sudo apt install python3.10-venv libportaudio2 libasound2-plugins -y}
+  \item \texttt{python3 -m venv \~{}/holos-env \&\& source \~{}/holos-env/bin/activate}
+  \item \texttt{pip install numpy sounddevice soundfile faster-whisper silero-vad}
+  \item Later added: \texttt{pip install omegaconf} (Silero dep), then \texttt{pip install git+https://github.com/robinhad/ukrainian-tts.git} (replacement TTS).
+  \end{itemize}
+\item \textbf{Silero v4\_ua failures (in order):}
+  \begin{enumerate}
+  \item \texttt{AttributeError: 'TTSModelMultiAcc\_v3' object has no attribute 'eval'} --- removed \texttt{.eval()} call.
+  \item \texttt{ModuleNotFoundError: No module named 'omegaconf'} --- pip installed.
+  \item \texttt{TTS Error: `speaker` should be in mykyta, random} --- v4\_ua only has ``mykyta'' as named speaker; changed default.
+  \item \texttt{TTS Error: } (empty message) on English input --- undiagnosed; Silero apparently rejects non-Cyrillic text without a proper exception. Abandoned.
+  \end{enumerate}
+\item \textbf{robinhad first-run downloads:} On first \texttt{TTS()} instantiation, downloads: (a) stanza Ukrainian corpus ($\sim$50~MB) to \texttt{\~{}/.cache/stanza/1.11.0/resources/}, (b) NLTK \texttt{averaged\_perceptron\_tagger} and \texttt{cmudict} to \texttt{\~{}/nltk\_data/}, (c) robinhad model weights (model.pth, config.yaml, spk\_xvector.ark, feats\_stats.npz, $\sim$300~MB total) from \texttt{github.com/robinhad/ukrainian-tts/releases/download/v6.0.0} to the current working directory.
+\item \textbf{Final observed latencies (with short prompt, on CPU):}
+  \begin{itemize}
+  \item Ukrainian prompt: ``Моя дочка порізала руку склом''
+  \item LLM response: 4 short sentences in Ukrainian, 11.8~s wall-clock.
+  \item TTS synthesis (all sentences): RTF = 3.0+, began playback after LLM completed.
+  \item Total time to first audio: $\sim$15~s from user input.
+  \end{itemize}
+\end{itemize}
+
 \textit{Design exploration: beacon mode.}
 \begin{itemize}
 \item Brainstormed an alternative deployment model: instead of a standalone voice-in/voice-out device, the Jetson (or more powerful hardware) acts as a \textbf{local inference beacon} that multiple users dial into during an emergency. Phones connect via local Wi-Fi or Bluetooth to the beacon's HTTP API. No internet required --- the beacon creates its own network.
@@ -409,12 +465,23 @@ This section is the living log of the project. Each day we add a dated entry des
 \item Hardware requirements: concurrent multi-user inference would need more VRAM than the Jetson Orin Nano's 8~GB shared pool (which can handle only one inference at a time). A Jetson AGX Orin (32--64~GB) or a mini PC with a discrete GPU would be needed. This is a future direction, not the hackathon scope.
 \end{itemize}
 
+\textbf{Status at end of Day 8.}
+\begin{itemize}
+\item JetPack 6.2.2 (r36.5) installed, cudaMalloc bug resolved.
+\item Bluetooth audio working end-to-end via phone hotspot SSH, with the specific PulseAudio TCP workaround documented.
+\item Two working pipeline variants on \texttt{master} (\texttt{jetson\_pipeline.py}, \texttt{jetson\_pipeline\_server.py}) and a third with three optimizations on \texttt{jetson-tts-optimizations} branch (\texttt{jetson\_pipeline\_streaming.py}). Server + streaming mode gives LLM response in 3-4~s after warmup.
+\item TTS produces correct, natural Ukrainian speech via the Tetiana voice but synthesis runs on CPU at RTF 3.0. Playback starts after LLM completes, not during.
+\item GRPO Colab notebook unchanged, still untested.
+\end{itemize}
+
 \textbf{What comes next (Day 9).}
 \begin{itemize}
-\item Start \texttt{llama-server} on Jetson and test the server-based pipeline end-to-end with Bluetooth audio (mic $\rightarrow$ ASR $\rightarrow$ LLM $\rightarrow$ TTS $\rightarrow$ speaker).
-\item Install Silero TTS v4\_ua in the Jetson venv and verify Ukrainian speech output quality.
-\item Test the GRPO Colab notebook (\texttt{training/holos\_medyk\_grpo\_colab.ipynb}) --- the training pipeline is ready but untested.
-\item Set up auto-reconnect for the Jetson Wi-Fi: \texttt{nmcli connection modify <conn> connection.autoconnect yes}.
+\item \textbf{Primary: GPU TTS.} Create parallel \texttt{\~{}/holos-env-gpu} venv with NVIDIA Jetson torch wheel (\texttt{pip install torch torchvision --index-url=https://pypi.jetson-ai-lab.io/jp6/cu126}, numpy==1.26.1). Test robinhad TTS on CUDA. Target: RTF $<$1.0 so streaming synthesis actually keeps up with streaming generation.
+\item If GPU TTS works and RTF drops below 1, sentence-streaming will deliver true real-time playback --- speech begins during LLM generation, not after.
+\item Auto-reconnect Wi-Fi on reboot: \texttt{nmcli connection modify <conn> connection.autoconnect yes}. Fix the ``physical keyboard needed after every reboot'' friction.
+\item Router fix: disable AP isolation on home router so we don't need phone hotspot for every session.
+\item Test the GRPO Colab notebook (\texttt{training/holos\_medyk\_grpo\_colab.ipynb}).
+\item Consider merging \texttt{jetson-tts-optimizations} into \texttt{master} once GPU TTS is proven.
 \end{itemize}
 
 \subsection*{Day 6 --- 2026-04-09 (Wednesday): SFT abandoned, GRPO pivot, system prompt overhaul}
